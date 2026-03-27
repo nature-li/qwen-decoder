@@ -4,8 +4,10 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <climits>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 #include "gguf_loader.h"
 
@@ -250,14 +252,14 @@ int load_tokenizer(Tokenizer& t, const GGUFFile& gguf) {
     t.vocab[i] = arr[i].str;
   }
 
-  // 读 scores
-  auto it_scores = gguf.metadata.find("tokenizer.ggml.scores");
-  if (it_scores != gguf.metadata.end()) {
-    const auto& score_arr = it_scores->second.arr;
-    t.scores.resize(score_arr.size());
-    for (int i = 0; i < (int)score_arr.size(); i++) {
-      t.scores[i] = score_arr[i].f32;
+  auto it_merges = gguf.metadata.find("tokenizer.ggml.merges");
+  if (it_merges != gguf.metadata.end()) {
+    const auto& arr = it_merges->second.arr;
+    t.merges.resize(arr.size());
+    for (int i = 0; i < (int)arr.size(); i++) {
+      t.merges[i] = arr[i].str;
     }
+    printf("merges size = %zu\n", t.merges.size());
   }
 
   // 读 token 类型
@@ -322,12 +324,23 @@ int encode(Tokenizer& t, const std::string& text, std::vector<int>& tokens) {
     }
   }
 
-  // 2. 每个字节先变成一个 token
-  for (unsigned char c : processed) {
-    std::string byte_str;
-    // 先尝试直接查词表
-    byte_str += (char)c;
-    int id = vocab_lookup(t, byte_str);
+  // 2. 按字符查词表，不是按字节
+  int i = 0;
+  while (i < (int)processed.size()) {
+    // 判断 UTF-8 字符长度
+    unsigned char c = (unsigned char)processed[i];
+    int char_len = 1;
+    if ((c & 0x80) == 0)
+      char_len = 1;  // ASCII
+    else if ((c & 0xE0) == 0xC0)
+      char_len = 2;  // 2字节 UTF-8，比如 Ġ
+    else if ((c & 0xF0) == 0xE0)
+      char_len = 3;  // 3字节
+    else if ((c & 0xF8) == 0xF0)
+      char_len = 4;  // 4字节
+
+    std::string ch = processed.substr(i, char_len);
+    int id = vocab_lookup(t, ch);
     if (id == -1) {
       // 找不到就用字节 token <0xXX>
       char buf[8];
@@ -335,30 +348,38 @@ int encode(Tokenizer& t, const std::string& text, std::vector<int>& tokens) {
       id = vocab_lookup(t, buf);
     }
     if (id != -1) tokens.push_back(id);
+    i += char_len;
   }
 
-  // 3. BPE merge
-  // 每轮找 score 最高的相邻 pair 合并
-  // 重复直到没有任何相邻 pair 能在词表里找到
+  // 先把 merges 建成 map，方便查找优先级
+  // key = "token1 token2"，value = merge 的 index（越小越优先）
+  std::unordered_map<std::string, int> merge_rank;
+  for (int i = 0; i < (int)t.merges.size(); i++) {
+    merge_rank[t.merges[i]] = i;
+  }
+
+  // BPE merge，找 rank 最小的 pair
   while (true) {
-    float best_score = -1e10f;
+    int best_rank = INT_MAX;
     int best_idx = -1;
     int best_id = -1;
 
     for (int i = 0; i < (int)tokens.size() - 1; i++) {
-      std::string merged = t.vocab[tokens[i]] + t.vocab[tokens[i + 1]];
-      int id = vocab_lookup(t, merged);
-      if (id != -1 && t.scores[id] > best_score) {
-        best_score = t.scores[id];
+      // merge 规则格式是 "token1 token2"，中间有空格
+      std::string pair = t.vocab[tokens[i]] + " " + t.vocab[tokens[i + 1]];
+      auto it = merge_rank.find(pair);
+      if (it != merge_rank.end() && it->second < best_rank) {
+        best_rank = it->second;
         best_idx = i;
-        best_id = id;
+        // 合并后的 token 就是两个字符串拼接（不带空格）
+        std::string merged = t.vocab[tokens[i]] + t.vocab[tokens[i + 1]];
+        best_id = vocab_lookup(t, merged);
       }
     }
 
     if (best_idx == -1) break;
 
     tokens[best_idx] = best_id;
-    // 删除第 best_idx+1 位置的 token
     tokens.erase(tokens.begin() + best_idx + 1);
   }
 

@@ -57,11 +57,11 @@ struct ModelFile {
 // ============================================================================
 struct Tokenizer {
   int vocab_size;
-  std::vector<std::string> vocab;  // token 字符串
-  std::vector<float> scores;       // BPE merge 分数
-  std::vector<int> token_type;     // token 类型
-  int bos_token_id;                // 151643
-  int eos_token_id;                // 151645
+  std::vector<std::string> vocab;   // token 字符串
+  std::vector<std::string> merges;  // BPE merge 规则，顺序就是优先级
+  std::vector<int> token_type;      // token 类型
+  int bos_token_id;                 // 151643
+  int eos_token_id;                 // 151645
 };
 
 // fp16 转 float

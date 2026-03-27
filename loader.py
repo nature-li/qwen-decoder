@@ -1,5 +1,6 @@
 from gguf import GGUFReader
 import numpy as np
+from transformers import AutoTokenizer
 
 reader = GGUFReader("qwen2.5-0.5b-instruct-fp16.gguf")
 for tensor in reader.tensors:
@@ -20,4 +21,12 @@ for key, val in reader.fields.items():
         print(f"vocab[1000]   = {tokens[1000]}")
         print(f"vocab[151643] = {tokens[151643]}")
         print(f"vocab[151645] = {tokens[151645]}")
+
+        # 手动实现简单的 encode 验证
+        text = "Hello world"
+        print(f"text: {text}")
+        # 看看 Hello 和 world 对应的 token id
+        for i, t in enumerate(tokens):
+            if t in ["Hello", "Ġworld", "world", "ĠHello"]:
+                print(f"vocab[{i}] = {t}")
         break
