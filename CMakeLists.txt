@@ -21,7 +21,7 @@ macro(add_cuda_target target)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 endmacro()
 
-add_executable(gguf_info main.cpp gguf_loader.cpp common.cpp decoder.cpp cpu_decoder.cpp)
+add_executable(cpu_decoder main.cpp gguf_loader.cpp common.cpp decoder.cpp cpu_decoder.cpp)
 
 add_cuda_target(gpu_decoder_v1
     gpu_main.cpp gpu_v1/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)

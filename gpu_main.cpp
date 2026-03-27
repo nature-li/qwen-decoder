@@ -1,7 +1,8 @@
-#include "gpu_v1/gpu_decoder.h"
 #include <ctime>
 #include <iostream>
 #include <random>
+
+#include "gpu_v1/gpu_decoder.h"
 
 int main(int argc, char** argv) {
   if (argc < 2) {
