@@ -279,28 +279,105 @@ int load_tokenizer(Tokenizer& t, const GGUFFile& gguf) {
   return 0;
 }
 
-const char* decode(Tokenizer& t, int token) {
-  const std::string& piece = t.vocab[token];
+static std::string cp_to_utf8(int cp) {
+  std::string s;
+  if (cp < 0x80) {
+    s += (char)cp;
+  } else if (cp < 0x800) {
+    s += (char)(0xC0 | (cp >> 6));
+    s += (char)(0x80 | (cp & 0x3F));
+  }
+  return s;
+}
 
-  // 特殊 token 返回空字符串
-  if (t.token_type[token] == 3) {  // 3 = control token
-    return "";
+static void build_maps(std::unordered_map<char, std::string>& b2u,
+                       std::unordered_map<std::string, char>& u2b) {
+  // 可打印字节直接映射，其余映射到 256+
+  std::vector<int> bs;
+  for (int i = 33; i <= 126; i++) bs.push_back(i);
+  for (int i = 161; i <= 172; i++) bs.push_back(i);
+  for (int i = 174; i <= 255; i++) bs.push_back(i);
+
+  std::vector<int> cs = bs;
+  int n = 0;
+  for (int b = 0; b < 256; b++) {
+    if (std::find(bs.begin(), bs.end(), b) == bs.end()) {
+      bs.push_back(b);
+      cs.push_back(256 + n++);
+    }
   }
 
-  // 处理 <0xXX> 字节 token
+  for (int i = 0; i < (int)bs.size(); i++) {
+    std::string utf8 = cp_to_utf8(cs[i]);
+    b2u[(char)bs[i]] = utf8;
+    u2b[utf8] = (char)bs[i];
+  }
+}
+
+const std::unordered_map<char, std::string>& get_byte_to_unicode() {
+  static std::unordered_map<char, std::string> b2u;
+  static std::unordered_map<std::string, char> u2b;
+  static bool initialized = false;
+  if (!initialized) {
+    build_maps(b2u, u2b);
+    initialized = true;
+  }
+  return b2u;
+}
+
+const std::unordered_map<std::string, char>& get_unicode_to_byte() {
+  static std::unordered_map<char, std::string> b2u;
+  static std::unordered_map<std::string, char> u2b;
+  static bool initialized = false;
+  if (!initialized) {
+    build_maps(b2u, u2b);
+    initialized = true;
+  }
+  return u2b;
+}
+
+const char* decode(Tokenizer& t, int token) {
+  if (t.token_type[token] == 3) return "";
+
   static char byte_piece[2];
   unsigned char byte_val;
-  // <0x    匹配字面字符 "<0x"
-  // %02hhX 读取两位十六进制数，存入 unsigned char
-  // >      匹配字面字符 ">"
-  // 成功表示匹配到了  <0xXX> 字节
-  if (sscanf(piece.c_str(), "<0x%02hhX>", &byte_val) == 1) {
+  if (sscanf(t.vocab[token].c_str(), "<0x%02hhX>", &byte_val) == 1) {
     byte_piece[0] = (char)byte_val;
     byte_piece[1] = '\0';
     return byte_piece;
   }
 
-  return piece.c_str();
+  // 把 GPT2 unicode 字符转回原始字节
+  const auto& u2b = get_unicode_to_byte();
+  static std::string result;
+  result.clear();
+
+  const std::string& piece = t.vocab[token];
+  int i = 0;
+  while (i < (int)piece.size()) {
+    // 判断 UTF-8 字符长度
+    unsigned char c = (unsigned char)piece[i];
+    int char_len = 1;
+    if ((c & 0x80) == 0x00)
+      char_len = 1;
+    else if ((c & 0xE0) == 0xC0)
+      char_len = 2;
+    else if ((c & 0xF0) == 0xE0)
+      char_len = 3;
+    else if ((c & 0xF8) == 0xF0)
+      char_len = 4;
+
+    std::string ch = piece.substr(i, char_len);
+    auto it = u2b.find(ch);
+    if (it != u2b.end()) {
+      result += it->second;  // 转回原始字节
+    } else {
+      result += ch;  // 找不到就原样输出
+    }
+    i += char_len;
+  }
+
+  return result.c_str();
 }
 
 // 在词表里查找字符串，返回 token id，找不到返回 -1
@@ -314,74 +391,211 @@ int vocab_lookup(const Tokenizer& t, const std::string& str) {
 int encode(Tokenizer& t, const std::string& text, std::vector<int>& tokens) {
   tokens.clear();
 
-  // 1. 把空格替换成 Ġ（U+0120，UTF-8 编码是 0xC4 0xA0）
-  std::string processed;
-  for (int i = 0; i < (int)text.size(); i++) {
-    if (text[i] == ' ') {
-      processed += "\xC4\xA0";  // Ġ
-    } else {
-      processed += text[i];
+  // 1. 收集特殊 token，按长度从长到短排序
+  std::vector<std::pair<std::string, int>> special_tokens;
+  for (int i = 0; i < t.vocab_size; i++) {
+    if (t.token_type[i] == 3) {
+      special_tokens.push_back({t.vocab[i], i});
+    }
+  }
+  std::sort(special_tokens.begin(), special_tokens.end(),
+            [](const auto& a, const auto& b) {
+              return a.first.size() > b.first.size();
+            });
+
+  // 2. 把文本按特殊 token 分割成多段
+  std::vector<std::string> segments;
+  std::vector<bool> is_special;
+
+  std::string remaining = text;
+  while (!remaining.empty()) {
+    bool found = false;
+    for (auto& [sp, id] : special_tokens) {
+      if (remaining.substr(0, sp.size()) == sp) {
+        segments.push_back(sp);
+        is_special.push_back(true);
+        remaining = remaining.substr(sp.size());
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      // 找到下一个特殊 token 的位置
+      size_t next_special = remaining.size();
+      for (auto& [sp, id] : special_tokens) {
+        size_t pos = remaining.find(sp);
+        if (pos != std::string::npos && pos < next_special) {
+          next_special = pos;
+        }
+      }
+      segments.push_back(remaining.substr(0, next_special));
+      is_special.push_back(false);
+      remaining = remaining.substr(next_special);
     }
   }
 
-  // 2. 按字符查词表，不是按字节
-  int i = 0;
-  while (i < (int)processed.size()) {
-    // 判断 UTF-8 字符长度
-    unsigned char c = (unsigned char)processed[i];
-    int char_len = 1;
-    if ((c & 0x80) == 0)
-      char_len = 1;  // ASCII
-    else if ((c & 0xE0) == 0xC0)
-      char_len = 2;  // 2字节 UTF-8，比如 Ġ
-    else if ((c & 0xF0) == 0xE0)
-      char_len = 3;  // 3字节
-    else if ((c & 0xF8) == 0xF0)
-      char_len = 4;  // 4字节
-
-    std::string ch = processed.substr(i, char_len);
-    int id = vocab_lookup(t, ch);
-    if (id == -1) {
-      // 找不到就用字节 token <0xXX>
-      char buf[8];
-      snprintf(buf, sizeof(buf), "<0x%02X>", c);
-      id = vocab_lookup(t, buf);
-    }
-    if (id != -1) tokens.push_back(id);
-    i += char_len;
-  }
-
-  // 先把 merges 建成 map，方便查找优先级
-  // key = "token1 token2"，value = merge 的 index（越小越优先）
+  // 3. 预建 merge_rank
   std::unordered_map<std::string, int> merge_rank;
   for (int i = 0; i < (int)t.merges.size(); i++) {
     merge_rank[t.merges[i]] = i;
   }
 
-  // BPE merge，找 rank 最小的 pair
-  while (true) {
-    int best_rank = INT_MAX;
-    int best_idx = -1;
-    int best_id = -1;
+  // 4. 对每段分别处理
+  for (int si = 0; si < (int)segments.size(); si++) {
+    if (is_special[si]) {
+      // 特殊 token 直接查词表
+      int id = vocab_lookup(t, segments[si]);
+      if (id != -1) tokens.push_back(id);
+      continue;
+    }
 
-    for (int i = 0; i < (int)tokens.size() - 1; i++) {
-      // merge 规则格式是 "token1 token2"，中间有空格
-      std::string pair = t.vocab[tokens[i]] + " " + t.vocab[tokens[i + 1]];
-      auto it = merge_rank.find(pair);
-      if (it != merge_rank.end() && it->second < best_rank) {
-        best_rank = it->second;
-        best_idx = i;
-        // 合并后的 token 就是两个字符串拼接（不带空格）
-        std::string merged = t.vocab[tokens[i]] + t.vocab[tokens[i + 1]];
-        best_id = vocab_lookup(t, merged);
+    // 普通文本走 BPE
+    std::vector<int> seg_tokens;
+
+    // 替换所有字节为对应 unicode
+    const auto& b2u = get_byte_to_unicode();
+    std::string processed;
+    for (unsigned char c : segments[si]) {
+      auto it = b2u.find((char)c);
+      if (it != b2u.end()) {
+        processed += it->second;
       }
     }
 
-    if (best_idx == -1) break;
+    // 按 UTF-8 字符初始化
+    int i = 0;
+    while (i < (int)processed.size()) {
+      unsigned char c = (unsigned char)processed[i];
+      int char_len = 1;
+      if ((c & 0x80) == 0x00)
+        char_len = 1;
+      else if ((c & 0xE0) == 0xC0)
+        char_len = 2;
+      else if ((c & 0xF0) == 0xE0)
+        char_len = 3;
+      else if ((c & 0xF8) == 0xF0)
+        char_len = 4;
 
-    tokens[best_idx] = best_id;
-    tokens.erase(tokens.begin() + best_idx + 1);
+      std::string ch = processed.substr(i, char_len);
+      int id = vocab_lookup(t, ch);
+      if (id != -1) {
+        seg_tokens.push_back(id);
+      } else {
+        // 找不到就按字节逐个用 <0xXX> 兜底
+        for (int b = 0; b < char_len; b++) {
+          unsigned char byte = (unsigned char)processed[i + b];
+          char buf[8];
+          snprintf(buf, sizeof(buf), "<0x%02X>", byte);
+          int byte_id = vocab_lookup(t, buf);
+          if (byte_id != -1) seg_tokens.push_back(byte_id);
+        }
+      }
+      i += char_len;
+    }
+
+    // BPE merge
+    while (true) {
+      int best_rank = INT_MAX;
+      int best_idx = -1;
+      int best_id = -1;
+
+      for (int j = 0; j < (int)seg_tokens.size() - 1; j++) {
+        std::string pair =
+            t.vocab[seg_tokens[j]] + " " + t.vocab[seg_tokens[j + 1]];
+        auto it = merge_rank.find(pair);
+        if (it != merge_rank.end() && it->second < best_rank) {
+          best_rank = it->second;
+          best_idx = j;
+          std::string merged =
+              t.vocab[seg_tokens[j]] + t.vocab[seg_tokens[j + 1]];
+          best_id = vocab_lookup(t, merged);
+        }
+      }
+
+      if (best_idx == -1) break;
+      seg_tokens[best_idx] = best_id;
+      seg_tokens.erase(seg_tokens.begin() + best_idx + 1);
+    }
+
+    for (int id : seg_tokens) tokens.push_back(id);
   }
 
   return 0;
+}
+
+std::string apply_chat_template(const std::string& user_input) {
+  return "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
+         "<|im_start|>user\n" +
+         user_input +
+         "<|im_end|>\n"
+         "<|im_start|>assistant\n";
+}
+
+int argmax(const float* logits, int size) {
+  int max_idx = 0;
+  float max_val = logits[0];
+  for (int i = 1; i < size; i++) {
+    if (logits[i] > max_val) {
+      max_val = logits[i];
+      max_idx = i;
+    }
+  }
+  return max_idx;
+}
+
+int sample_topk(const float* logits, int size, int k, float temperature,
+                std::mt19937& rng) {
+  if (temperature == 0.0f) {
+    return argmax(logits, size);
+  }
+
+  if (k <= 0 || k >= size) {
+    // 退化成普通 temperature 采样
+    std::vector<float> probs(size);
+    float max_val = *std::max_element(logits, logits + size);
+    float sum = 0.0f;
+    for (int i = 0; i < size; i++) {
+      probs[i] = expf((logits[i] - max_val) / temperature);
+      sum += probs[i];
+    }
+    std::uniform_real_distribution<float> dis(0.0f, 1.0f);
+    float r = dis(rng);
+    float cur = 0.0f;
+    for (int i = 0; i < size; i++) {
+      cur += probs[i] / sum;
+      if (r <= cur) return i;
+    }
+    return size - 1;
+  }
+
+  // 1. 找第 k 大的阈值
+  std::vector<float> tmp(logits, logits + size);
+  std::nth_element(tmp.begin(), tmp.begin() + k - 1, tmp.end(),
+                   std::greater<float>());
+  float threshold = tmp[k - 1];
+
+  // 2. 只保留 top-k，其余归零
+  std::vector<float> probs(size);
+  float max_val = logits[0];
+  for (int i = 1; i < size; i++) max_val = fmaxf(max_val, logits[i]);
+
+  float sum = 0.0f;
+  for (int i = 0; i < size; i++) {
+    if (logits[i] >= threshold) {
+      probs[i] = expf((logits[i] - max_val) / temperature);
+    } else {
+      probs[i] = 0.0f;
+    }
+    sum += probs[i];
+  }
+
+  // 3. 轮盘赌采样
+  std::uniform_real_distribution<float> dis(0.0f, 1.0f);
+  float r = dis(rng);
+  float cur = 0.0f;
+  for (int i = 0; i < size; i++) {
+    cur += probs[i] / sum;
+    if (r <= cur) return i;
+  }
+  return size - 1;
 }

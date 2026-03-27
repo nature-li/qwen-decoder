@@ -1,6 +1,8 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -64,6 +66,10 @@ struct Tokenizer {
   int eos_token_id;                 // 151645
 };
 
+// GPT2 bytes_to_unicode 映射表
+const std::unordered_map<char, std::string>& get_byte_to_unicode();
+const std::unordered_map<std::string, char>& get_unicode_to_byte();
+
 // fp16 转 float
 float fp16_to_float(uint16_t h);
 int open_model(const std::string& path, ModelFile& mf);
@@ -91,3 +97,9 @@ int vocab_lookup(const Tokenizer& t, const std::string& str);
 
 const char* decode(Tokenizer& t, int token);
 int encode(Tokenizer& t, const std::string& text, std::vector<int>& tokens);
+
+std::string apply_chat_template(const std::string& user_input);
+
+int argmax(const float* logits, int size);
+int sample_topk(const float* logits, int size, int k, float temperature,
+                std::mt19937& rng);
