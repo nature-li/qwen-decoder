@@ -276,3 +276,91 @@ int load_tokenizer(Tokenizer& t, const GGUFFile& gguf) {
 
   return 0;
 }
+
+const char* decode(Tokenizer& t, int token) {
+  const std::string& piece = t.vocab[token];
+
+  // 特殊 token 返回空字符串
+  if (t.token_type[token] == 3) {  // 3 = control token
+    return "";
+  }
+
+  // 处理 <0xXX> 字节 token
+  static char byte_piece[2];
+  unsigned char byte_val;
+  // <0x    匹配字面字符 "<0x"
+  // %02hhX 读取两位十六进制数，存入 unsigned char
+  // >      匹配字面字符 ">"
+  // 成功表示匹配到了  <0xXX> 字节
+  if (sscanf(piece.c_str(), "<0x%02hhX>", &byte_val) == 1) {
+    byte_piece[0] = (char)byte_val;
+    byte_piece[1] = '\0';
+    return byte_piece;
+  }
+
+  return piece.c_str();
+}
+
+// 在词表里查找字符串，返回 token id，找不到返回 -1
+int vocab_lookup(const Tokenizer& t, const std::string& str) {
+  for (int i = 0; i < t.vocab_size; i++) {
+    if (t.vocab[i] == str) return i;
+  }
+  return -1;
+}
+
+int encode(Tokenizer& t, const std::string& text, std::vector<int>& tokens) {
+  tokens.clear();
+
+  // 1. 把空格替换成 Ġ（U+0120，UTF-8 编码是 0xC4 0xA0）
+  std::string processed;
+  for (int i = 0; i < (int)text.size(); i++) {
+    if (text[i] == ' ') {
+      processed += "\xC4\xA0";  // Ġ
+    } else {
+      processed += text[i];
+    }
+  }
+
+  // 2. 每个字节先变成一个 token
+  for (unsigned char c : processed) {
+    std::string byte_str;
+    // 先尝试直接查词表
+    byte_str += (char)c;
+    int id = vocab_lookup(t, byte_str);
+    if (id == -1) {
+      // 找不到就用字节 token <0xXX>
+      char buf[8];
+      snprintf(buf, sizeof(buf), "<0x%02X>", c);
+      id = vocab_lookup(t, buf);
+    }
+    if (id != -1) tokens.push_back(id);
+  }
+
+  // 3. BPE merge
+  // 每轮找 score 最高的相邻 pair 合并
+  // 重复直到没有任何相邻 pair 能在词表里找到
+  while (true) {
+    float best_score = -1e10f;
+    int best_idx = -1;
+    int best_id = -1;
+
+    for (int i = 0; i < (int)tokens.size() - 1; i++) {
+      std::string merged = t.vocab[tokens[i]] + t.vocab[tokens[i + 1]];
+      int id = vocab_lookup(t, merged);
+      if (id != -1 && t.scores[id] > best_score) {
+        best_score = t.scores[id];
+        best_idx = i;
+        best_id = id;
+      }
+    }
+
+    if (best_idx == -1) break;
+
+    tokens[best_idx] = best_id;
+    // 删除第 best_idx+1 位置的 token
+    tokens.erase(tokens.begin() + best_idx + 1);
+  }
+
+  return 0;
+}
