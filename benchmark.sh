@@ -3,7 +3,7 @@
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 BUILD_DIR=$SCRIPT_DIR/build
 MODEL=$SCRIPT_DIR/qwen2.5-3b-instruct-fp16.gguf
-PROMPT="who are you"
+PROMPT="who are you? could you tell me a joke?"
 
 # echo "=== CPU ==="
 # echo "$PROMPT" | $BUILD_DIR/cpu_decoder $MODEL
