@@ -22,9 +22,16 @@ static T read_val(FILE* f) {
   return val;
 }
 
+/**
+ * GGUF 里字符串存储格式为
+ * [8字节长度][length字节字符串内容]
+ */
 static std::string read_string(FILE* f) {
+  // 先读 8 字节，得到字符串长度
   uint64_t len = read_val<uint64_t>(f);
+  // 构造一个长度为 len 的字符串，全部填充 '\0'
   std::string str(len, '\0');
+  // 从文件读 len 个字节，写入 str 的内存
   read_bytes(f, str.data(), len);
   return str;
 }
