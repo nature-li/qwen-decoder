@@ -121,9 +121,9 @@ int load_gguf(GGUFFile& gguf, const std::string& path) {
     return -1;
   }
 
-  printf("GGUF version: %d\n", gguf.header.version);
-  printf("n_tensors:    %lu\n", gguf.header.n_tensors);
-  printf("n_kv:         %lu\n", gguf.header.n_kv);
+//   printf("GGUF version: %d\n", gguf.header.version);
+//   printf("n_tensors:    %lu\n", gguf.header.n_tensors);
+//   printf("n_kv:         %lu\n", gguf.header.n_kv);
 
   // 2. 读元数据 key-value
   for (uint64_t i = 0; i < gguf.header.n_kv; i++) {

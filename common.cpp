@@ -78,14 +78,14 @@ int load_config(Config& config, const GGUFFile& gguf) {
     }
   }
 
-  printf("dim            = %d\n", config.dim);
-  printf("hidden_dim     = %d\n", config.hidden_dim);
-  printf("n_layers       = %d\n", config.n_layers);
-  printf("n_heads        = %d\n", config.n_heads);
-  printf("n_kv_heads     = %d\n", config.n_kv_heads);
-  printf("vocab_size     = %d\n", config.vocab_size);
-  printf("seq_len        = %d\n", config.seq_len);
-  printf("rope_freq_base = %.1f\n", config.rope_freq_base);
+  // printf("dim            = %d\n", config.dim);
+  // printf("hidden_dim     = %d\n", config.hidden_dim);
+  // printf("n_layers       = %d\n", config.n_layers);
+  // printf("n_heads        = %d\n", config.n_heads);
+  // printf("n_kv_heads     = %d\n", config.n_kv_heads);
+  // printf("vocab_size     = %d\n", config.vocab_size);
+  // printf("seq_len        = %d\n", config.seq_len);
+  // printf("rope_freq_base = %.1f\n", config.rope_freq_base);
 
   return 0;
 }
@@ -271,7 +271,7 @@ int load_tokenizer(Tokenizer& t, const GGUFFile& gguf) {
     }
   }
 
-  printf("vocab_size     = %d\n", t.vocab_size);
+  // printf("vocab_size     = %d\n", t.vocab_size);
 
   return 0;
 }
