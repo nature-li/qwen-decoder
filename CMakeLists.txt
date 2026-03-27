@@ -24,4 +24,6 @@ endmacro()
 add_executable(cpu_decoder cpu_main.cpp gguf_loader.cpp common.cpp decoder.cpp cpu_decoder.cpp)
 
 add_cuda_target(gpu_decoder_v1
-    gpu_main.cpp gpu_v1/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
+    gpu_v1/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
+add_cuda_target(gpu_decoder_v2
+    gpu_v2/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)

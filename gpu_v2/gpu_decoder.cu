@@ -40,6 +40,15 @@ static void upload_weights(GPUWeights& gw, const Weights& w,
         cudaMemcpy(*dst, src, n * sizeof(float), cudaMemcpyHostToDevice));
   };
 
+  // 上传 fp16 权重，转成 fp32 再上传
+  // auto upload_fp16_as_fp32 = [](float** dst, const uint16_t* src, size_t n) {
+  //   std::vector<float> tmp(n);
+  //   for (size_t i = 0; i < n; i++) tmp[i] = fp16_to_float(src[i]);
+  //   CHECK_CUDA(cudaMalloc(dst, n * sizeof(float)));
+  //   CHECK_CUDA(cudaMemcpy(*dst, tmp.data(), n * sizeof(float),
+  //                         cudaMemcpyHostToDevice));
+  // };
+
   upload_fp16(&gw.token_embedding, w.token_embedding,
               (size_t)vocab_size * config.dim);
   upload_fp32(&gw.rms_final, w.rms_final, config.dim);
@@ -132,6 +141,12 @@ static void alloc_gpu_run_state(GPURunState& s, const Config& config) {
   CHECK_CUDA(cudaMalloc(
       &s.v_cache, (size_t)config.n_layers * seq_len * kv_dim * sizeof(float)));
   CHECK_CUDA(cudaMallocHost(&s.logits, config.vocab_size * sizeof(float)));
+
+  int max_n = std::max({config.dim, config.hidden_dim, config.vocab_size});
+  CHECK_CUDA(cudaMalloc(&s.xb_fp16, max_n * sizeof(uint16_t)));
+  CHECK_CUDA(cudaMalloc(&s.out_fp16, max_n * sizeof(uint16_t)));
+  printf("max_n = %d, xb_fp16 = %p, out_fp16 = %p\n", max_n, s.xb_fp16,
+         s.out_fp16);
 }
 
 static void free_gpu_run_state(GPURunState& s) {
@@ -147,6 +162,8 @@ static void free_gpu_run_state(GPURunState& s) {
   cudaFree(s.k_cache);
   cudaFree(s.v_cache);
   cudaFreeHost(s.logits);
+  cudaFree(s.xb_fp16);
+  cudaFree(s.out_fp16);
 }
 
 // ============================================================================
@@ -245,6 +262,55 @@ __global__ void matmul_fp16_kernel(float* out, const float* x,
     }
     out[i] = val;
   }
+}
+
+/**
+ * 把 fp32 向量转成 fp16
+ * Grid:  (n + 255) / 256 个 block
+ * Block: 256 个线程
+ */
+__global__ void fp32_to_fp16_kernel(uint16_t* out, const float* in, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    // out[i] = __float2half(in[i]);
+    // 用 __half 类型中转
+    __half h = __float2half(in[i]);
+    uint16_t result;
+    memcpy(&result, &h, sizeof(uint16_t));
+    out[i] = result;
+  }
+}
+
+__global__ void fp16_to_fp32_kernel(float* out, const uint16_t* in, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __half2float(*((__half*)&in[i]));
+}
+
+void matmul_fp16_cublas(cublasHandle_t handle, float* out, const float* x,
+                        const uint16_t* w, int n, int d, uint16_t* x_fp16,
+                        uint16_t* out_fp16) {
+  int threads = 256;
+  fp32_to_fp16_kernel<<<(n + threads - 1) / threads, threads>>>(x_fp16, x, n);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    fprintf(stderr, "fp32_to_fp16_kernel error: %s\n", cudaGetErrorString(err));
+  }
+  cudaDeviceSynchronize();
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    fprintf(stderr, "after sync error: %s\n", cudaGetErrorString(err));
+  }
+
+  const __half alpha = __float2half(1.0f);
+  const __half beta = __float2half(0.0f);
+  cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, d, 1, n, &alpha,
+              (const __half*)w, n, (const __half*)x_fp16, n, &beta,
+              (__half*)out_fp16, d);
+  cudaDeviceSynchronize();
+
+  fp16_to_fp32_kernel<<<(d + threads - 1) / threads, threads>>>(out, out_fp16,
+                                                                d);
+  cudaDeviceSynchronize();
 }
 
 /**
@@ -413,10 +479,18 @@ GPUDecoder::GPUDecoder(const std::string& model_file) {
   }
 
   upload_weights(gw, w, config);
+  CHECK_CUDA(cudaGetLastError());
   alloc_gpu_run_state(gs, config);
+  CHECK_CUDA(cudaGetLastError());
+  cublasStatus_t status = cublasCreate(&cublas_handle);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    fprintf(stderr, "cublasCreate failed: %d\n", status);
+    exit(1);
+  }
 }
 
 GPUDecoder::~GPUDecoder() {
+  cublasDestroy(cublas_handle);
   free_gpu_run_state(gs);
   free_gpu_weights(gw, config);
   free_weights(w);
@@ -444,12 +518,12 @@ void GPUDecoder::forward(int token, int pos) {
     rmsnorm_kernel<<<1, threads>>>(gs.xb, gs.x, gw.rms_att[l], dim);
 
     // 3. QKV 投影
-    matmul_fp16_kernel<<<(dim + threads - 1) / threads, threads>>>(
-        gs.q, gs.xb, gw.wq[l], dim, dim);
-    matmul_fp16_kernel<<<(kv_dim + threads - 1) / threads, threads>>>(
-        gs.k, gs.xb, gw.wk[l], dim, kv_dim);
-    matmul_fp16_kernel<<<(kv_dim + threads - 1) / threads, threads>>>(
-        gs.v, gs.xb, gw.wv[l], dim, kv_dim);
+    matmul_fp16_cublas(cublas_handle, gs.q, gs.xb, gw.wq[l], dim, dim,
+                       gs.xb_fp16, gs.out_fp16);
+    matmul_fp16_cublas(cublas_handle, gs.k, gs.xb, gw.wk[l], dim, kv_dim,
+                       gs.xb_fp16, gs.out_fp16);
+    matmul_fp16_cublas(cublas_handle, gs.v, gs.xb, gw.wv[l], dim, kv_dim,
+                       gs.xb_fp16, gs.out_fp16);
 
     // 4. 加 bias
     add_bias_kernel<<<(dim + threads - 1) / threads, threads>>>(gs.q, gw.bq[l],
@@ -476,8 +550,8 @@ void GPUDecoder::forward(int token, int pos) {
         config.seq_len, kv_dim, head_dim, kv_mul);
 
     // 8. 输出投影 + 残差
-    matmul_fp16_kernel<<<(dim + threads - 1) / threads, threads>>>(
-        gs.xb2, gs.xb, gw.wo[l], dim, dim);
+    matmul_fp16_cublas(cublas_handle, gs.xb2, gs.xb, gw.wo[l], dim, dim,
+                       gs.xb_fp16, gs.out_fp16);
     residual_kernel<<<(dim + threads - 1) / threads, threads>>>(gs.x, gs.xb2,
                                                                 dim);
 
@@ -485,18 +559,16 @@ void GPUDecoder::forward(int token, int pos) {
     rmsnorm_kernel<<<1, threads>>>(gs.xb, gs.x, gw.rms_ffn[l], dim);
 
     // 10. SwiGLU FFN
-    matmul_fp16_kernel<<<(config.hidden_dim + threads - 1) / threads,
-                         threads>>>(gs.hb, gs.xb, gw.w1[l], dim,
-                                    config.hidden_dim);
-    matmul_fp16_kernel<<<(config.hidden_dim + threads - 1) / threads,
-                         threads>>>(gs.hb2, gs.xb, gw.w3[l], dim,
-                                    config.hidden_dim);
+    matmul_fp16_cublas(cublas_handle, gs.hb, gs.xb, gw.w1[l], dim,
+                       config.hidden_dim, gs.xb_fp16, gs.out_fp16);
+    matmul_fp16_cublas(cublas_handle, gs.hb2, gs.xb, gw.w3[l], dim,
+                       config.hidden_dim, gs.xb_fp16, gs.out_fp16);
     swiglu_kernel<<<(config.hidden_dim + threads - 1) / threads, threads>>>(
         gs.hb, gs.hb2, config.hidden_dim);
 
     // 11. FFN 输出投影 + 残差
-    matmul_fp16_kernel<<<(dim + threads - 1) / threads, threads>>>(
-        gs.xb2, gs.hb, gw.w2[l], config.hidden_dim, dim);
+    matmul_fp16_cublas(cublas_handle, gs.xb2, gs.hb, gw.w2[l],
+                       config.hidden_dim, dim, gs.xb_fp16, gs.out_fp16);
     residual_kernel<<<(dim + threads - 1) / threads, threads>>>(gs.x, gs.xb2,
                                                                 dim);
   }
@@ -505,8 +577,8 @@ void GPUDecoder::forward(int token, int pos) {
   rmsnorm_kernel<<<1, threads>>>(gs.xb, gs.x, gw.rms_final, dim);
 
   // 13. 输出 logits 到 pinned memory
-  matmul_fp16_kernel<<<(config.vocab_size + threads - 1) / threads, threads>>>(
-      gs.logits, gs.xb, gw.wcls, dim, config.vocab_size);
+  matmul_fp16_cublas(cublas_handle, gs.logits, gs.xb, gw.wcls, dim,
+                     config.vocab_size, gs.xb_fp16, gs.out_fp16);
 }
 
 int main(int argc, char** argv) {
