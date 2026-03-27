@@ -225,3 +225,54 @@ float fp16_to_float(uint16_t h) {
   memcpy(&result, &f, sizeof(float));
   return result;
 }
+
+int load_tokenizer(Tokenizer& t, const GGUFFile& gguf) {
+  // 读 bos/eos token id
+  auto it_bos = gguf.metadata.find("tokenizer.ggml.bos_token_id");
+  auto it_eos = gguf.metadata.find("tokenizer.ggml.eos_token_id");
+  if (it_bos == gguf.metadata.end() || it_eos == gguf.metadata.end()) {
+    fprintf(stderr, "missing bos/eos token id\n");
+    return -1;
+  }
+  t.bos_token_id = (int)it_bos->second.u32;
+  t.eos_token_id = (int)it_eos->second.u32;
+
+  // 读 token 列表
+  auto it_tokens = gguf.metadata.find("tokenizer.ggml.tokens");
+  if (it_tokens == gguf.metadata.end()) {
+    fprintf(stderr, "missing tokenizer.ggml.tokens\n");
+    return -1;
+  }
+  const auto& arr = it_tokens->second.arr;
+  t.vocab_size = (int)arr.size();
+  t.vocab.resize(t.vocab_size);
+  for (int i = 0; i < t.vocab_size; i++) {
+    t.vocab[i] = arr[i].str;
+  }
+
+  // 读 scores
+  auto it_scores = gguf.metadata.find("tokenizer.ggml.scores");
+  if (it_scores != gguf.metadata.end()) {
+    const auto& score_arr = it_scores->second.arr;
+    t.scores.resize(score_arr.size());
+    for (int i = 0; i < (int)score_arr.size(); i++) {
+      t.scores[i] = score_arr[i].f32;
+    }
+  }
+
+  // 读 token 类型
+  auto it_types = gguf.metadata.find("tokenizer.ggml.token_type");
+  if (it_types != gguf.metadata.end()) {
+    const auto& type_arr = it_types->second.arr;
+    t.token_type.resize(type_arr.size());
+    for (int i = 0; i < (int)type_arr.size(); i++) {
+      t.token_type[i] = (int)type_arr[i].i32;
+    }
+  }
+
+  printf("vocab_size     = %d\n", t.vocab_size);
+  printf("bos_token_id   = %d\n", t.bos_token_id);
+  printf("eos_token_id   = %d\n", t.eos_token_id);
+
+  return 0;
+}

@@ -81,3 +81,5 @@ int load_weights(Weights& w, const Config& config, const GGUFFile& gguf,
                  const ModelFile& mf);
 
 void free_weights(Weights& w);
+
+int load_tokenizer(Tokenizer& t, const GGUFFile& gguf);
