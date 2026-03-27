@@ -380,14 +380,15 @@ __global__ void kvcache_write_kernel(float* k_cache, float* v_cache,
  * shared memory: [seq_len] 存 attention scores
  */
 __global__ void attention_kernel(const float* q, const float* k_cache,
-                                 const float* v_cache, float* out, int pos,
-                                 int seq_len, int kv_dim, int head_dim,
+                                 const float* v_cache, float* out, float* att,
+                                 int pos, int seq_len, int kv_dim, int head_dim,
                                  int kv_mul) {
   int h = blockIdx.x;
   int tid = threadIdx.x;
   float scale = rsqrtf((float)head_dim);
 
-  extern __shared__ float scores[];
+  // 每个 head 用自己的 att 区域
+  float* scores = att + h * seq_len;
 
   const float* q_head = q + h * head_dim;
 
@@ -541,10 +542,9 @@ void GPUDecoder::forward(int token, int pos) {
         gs.k_cache, gs.v_cache, gs.k, gs.v, l, pos, config.seq_len, kv_dim);
 
     // 7. Attention
-    size_t shared_mem = config.seq_len * sizeof(float);
-    attention_kernel<<<config.n_heads, threads, shared_mem>>>(
+    attention_kernel<<<config.n_heads, threads>>>(
         gs.q, gs.k_cache + (size_t)l * config.seq_len * kv_dim,
-        gs.v_cache + (size_t)l * config.seq_len * kv_dim, gs.xb, pos,
+        gs.v_cache + (size_t)l * config.seq_len * kv_dim, gs.xb, gs.att, pos,
         config.seq_len, kv_dim, head_dim, kv_mul);
 
     // 8. 输出投影 + 残差

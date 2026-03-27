@@ -2,7 +2,7 @@
 
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 BUILD_DIR=$SCRIPT_DIR/build
-MODEL=$SCRIPT_DIR/qwen2.5-1.5b-instruct-fp16.gguf
+MODEL=$SCRIPT_DIR/qwen2.5-3b-instruct-fp16.gguf
 PROMPT="who are you"
 
 # echo "=== CPU ==="
