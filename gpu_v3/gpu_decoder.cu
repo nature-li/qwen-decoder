@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <vector>
 
 #include "gpu_decoder.h"
 
@@ -16,6 +17,24 @@
     }                                                                         \
   }
 
+#define CHECK_CUBLAS(call)                                                \
+  {                                                                       \
+    cublasStatus_t status = call;                                         \
+    if (status != CUBLAS_STATUS_SUCCESS) {                                \
+      fprintf(stderr, "cuBLAS Error: %d at line %d\n", status, __LINE__); \
+      exit(1);                                                            \
+    }                                                                     \
+  }
+
+// ============================================================================
+// 辅助函数：CPU 端 float -> __half
+// ============================================================================
+
+static __half float_to_half(float f) {
+  __half h = __float2half(f);
+  return h;
+}
+
 // ============================================================================
 // GPUWeights 上传/释放
 // ============================================================================
@@ -26,47 +45,37 @@ static void upload_weights(GPUWeights& gw, const Weights& w,
   int kv_dim = config.n_kv_heads * head_dim;
   int vocab_size = config.vocab_size;
 
-  // 上传 fp16 数组的 lambda
-  auto upload_fp16 = [](uint16_t** dst, const uint16_t* src, size_t n) {
-    CHECK_CUDA(cudaMalloc(dst, n * sizeof(uint16_t)));
+  // 上传 fp16（uint16_t* -> __half*）
+  auto upload_fp16 = [](__half** dst, const uint16_t* src, size_t n) {
+    CHECK_CUDA(cudaMalloc(dst, n * sizeof(__half)));
     CHECK_CUDA(
-        cudaMemcpy(*dst, src, n * sizeof(uint16_t), cudaMemcpyHostToDevice));
+        cudaMemcpy(*dst, src, n * sizeof(__half), cudaMemcpyHostToDevice));
   };
 
-  // 上传 fp32 数组的 lambda
+  // 上传 fp32
   auto upload_fp32 = [](float** dst, const float* src, size_t n) {
     CHECK_CUDA(cudaMalloc(dst, n * sizeof(float)));
     CHECK_CUDA(
         cudaMemcpy(*dst, src, n * sizeof(float), cudaMemcpyHostToDevice));
   };
 
-  // 上传 fp16 权重，转成 fp32 再上传
-  // auto upload_fp16_as_fp32 = [](float** dst, const uint16_t* src, size_t n) {
-  //   std::vector<float> tmp(n);
-  //   for (size_t i = 0; i < n; i++) tmp[i] = fp16_to_float(src[i]);
-  //   CHECK_CUDA(cudaMalloc(dst, n * sizeof(float)));
-  //   CHECK_CUDA(cudaMemcpy(*dst, tmp.data(), n * sizeof(float),
-  //                         cudaMemcpyHostToDevice));
-  // };
-
   upload_fp16(&gw.token_embedding, w.token_embedding,
               (size_t)vocab_size * config.dim);
   upload_fp32(&gw.rms_final, w.rms_final, config.dim);
   upload_fp16(&gw.wcls, w.wcls, (size_t)vocab_size * config.dim);
 
-  // 每层权重
   gw.rms_att = new float*[config.n_layers];
-  gw.wq = new uint16_t*[config.n_layers];
-  gw.wk = new uint16_t*[config.n_layers];
-  gw.wv = new uint16_t*[config.n_layers];
-  gw.wo = new uint16_t*[config.n_layers];
+  gw.wq = new __half*[config.n_layers];
+  gw.wk = new __half*[config.n_layers];
+  gw.wv = new __half*[config.n_layers];
+  gw.wo = new __half*[config.n_layers];
   gw.bq = new float*[config.n_layers];
   gw.bk = new float*[config.n_layers];
   gw.bv = new float*[config.n_layers];
   gw.rms_ffn = new float*[config.n_layers];
-  gw.w1 = new uint16_t*[config.n_layers];
-  gw.w2 = new uint16_t*[config.n_layers];
-  gw.w3 = new uint16_t*[config.n_layers];
+  gw.w1 = new __half*[config.n_layers];
+  gw.w2 = new __half*[config.n_layers];
+  gw.w3 = new __half*[config.n_layers];
 
   for (int l = 0; l < config.n_layers; l++) {
     upload_fp32(&gw.rms_att[l], w.rms_att[l], config.dim);
@@ -127,24 +136,21 @@ static void alloc_gpu_run_state(GPURunState& s, const Config& config) {
   int kv_dim = config.n_kv_heads * (config.dim / config.n_heads);
   int seq_len = config.seq_len;
 
-  CHECK_CUDA(cudaMalloc(&s.x, dim * sizeof(float)));
-  CHECK_CUDA(cudaMalloc(&s.xb, dim * sizeof(float)));
-  CHECK_CUDA(cudaMalloc(&s.xb2, dim * sizeof(float)));
-  CHECK_CUDA(cudaMalloc(&s.q, dim * sizeof(float)));
-  CHECK_CUDA(cudaMalloc(&s.k, kv_dim * sizeof(float)));
-  CHECK_CUDA(cudaMalloc(&s.v, kv_dim * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&s.x, dim * sizeof(__half)));
+  CHECK_CUDA(cudaMalloc(&s.xb, dim * sizeof(__half)));
+  CHECK_CUDA(cudaMalloc(&s.xb2, dim * sizeof(__half)));
+  CHECK_CUDA(cudaMalloc(&s.q, dim * sizeof(__half)));
+  CHECK_CUDA(cudaMalloc(&s.k, kv_dim * sizeof(__half)));
+  CHECK_CUDA(cudaMalloc(&s.v, kv_dim * sizeof(__half)));
   CHECK_CUDA(cudaMalloc(&s.att, config.n_heads * seq_len * sizeof(float)));
-  CHECK_CUDA(cudaMalloc(&s.hb, config.hidden_dim * sizeof(float)));
-  CHECK_CUDA(cudaMalloc(&s.hb2, config.hidden_dim * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&s.hb, config.hidden_dim * sizeof(__half)));
+  CHECK_CUDA(cudaMalloc(&s.hb2, config.hidden_dim * sizeof(__half)));
   CHECK_CUDA(cudaMalloc(
-      &s.k_cache, (size_t)config.n_layers * seq_len * kv_dim * sizeof(float)));
+      &s.k_cache, (size_t)config.n_layers * seq_len * kv_dim * sizeof(__half)));
   CHECK_CUDA(cudaMalloc(
-      &s.v_cache, (size_t)config.n_layers * seq_len * kv_dim * sizeof(float)));
+      &s.v_cache, (size_t)config.n_layers * seq_len * kv_dim * sizeof(__half)));
   CHECK_CUDA(cudaMallocHost(&s.logits, config.vocab_size * sizeof(float)));
-
-  int max_n = std::max({config.dim, config.hidden_dim, config.vocab_size});
-  CHECK_CUDA(cudaMalloc(&s.xb_fp16, max_n * sizeof(uint16_t)));
-  CHECK_CUDA(cudaMalloc(&s.out_fp16, max_n * sizeof(uint16_t)));
+  CHECK_CUDA(cudaMalloc(&s.logits_fp16, config.vocab_size * sizeof(__half)));
 }
 
 static void free_gpu_run_state(GPURunState& s) {
@@ -160,8 +166,7 @@ static void free_gpu_run_state(GPURunState& s) {
   cudaFree(s.k_cache);
   cudaFree(s.v_cache);
   cudaFreeHost(s.logits);
-  cudaFree(s.xb_fp16);
-  cudaFree(s.out_fp16);
+  cudaFree(s.logits_fp16);
 }
 
 // ============================================================================
@@ -169,37 +174,22 @@ static void free_gpu_run_state(GPURunState& s) {
 // ============================================================================
 
 /**
- * Embedding lookup kernel (fp16 -> float)
+ * Embedding lookup kernel (fp16 -> __half)
  * Grid:  (dim + 255) / 256 个 block
  * Block: 256 个线程
  * 每个 thread 负责 out 的 1 个元素
  */
-__global__ void embedding_kernel(float* out, const uint16_t* table, int token,
+__global__ void embedding_kernel(__half* out, const __half* table, int token,
                                  int dim) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < dim) {
-    uint16_t h = table[token * dim + i];
-    // fp16 -> float
-    uint32_t sign = (h >> 15) & 0x1;
-    uint32_t exponent = (h >> 10) & 0x1f;
-    uint32_t mantissa = h & 0x3ff;
-    uint32_t f;
-    if (exponent == 0) {
-      f = (sign << 31) | (mantissa << 13);
-    } else if (exponent == 31) {
-      f = (sign << 31) | (0xff << 23) | (mantissa << 13);
-    } else {
-      f = (sign << 31) | ((exponent + 112) << 23) | (mantissa << 13);
-    }
-    out[i] = __uint_as_float(f);
-  }
+  if (i < dim) out[i] = table[token * dim + i];
 }
 
 /**
  * RMSNorm kernel (warp reduce)
+ * 输入 x 是 fp16，权重是 fp32，输出是 fp16
  * Grid:  1 个 block
  * Block: 256 个线程
- * 每个 thread 负责跨步累加平方和
  */
 __device__ float warp_reduce_sum(float val) {
   for (int offset = 16; offset > 0; offset >>= 1)
@@ -207,15 +197,18 @@ __device__ float warp_reduce_sum(float val) {
   return val;
 }
 
-__global__ void rmsnorm_kernel(float* out, const float* x, const float* weight,
-                               int dim) {
+__global__ void rmsnorm_kernel(__half* out, const __half* x,
+                               const float* weight, int dim) {
   __shared__ float warp_sums[8];
   int tid = threadIdx.x;
   int warp_id = tid / 32;
   int lane_id = tid % 32;
 
   float local_sum = 0.0f;
-  for (int i = tid; i < dim; i += blockDim.x) local_sum += x[i] * x[i];
+  for (int i = tid; i < dim; i += blockDim.x) {
+    float xi = __half2float(x[i]);
+    local_sum += xi * xi;
+  }
 
   local_sum = warp_reduce_sum(local_sum);
   if (lane_id == 0) warp_sums[warp_id] = local_sum;
@@ -229,108 +222,28 @@ __global__ void rmsnorm_kernel(float* out, const float* x, const float* weight,
   __syncthreads();
 
   float norm = rsqrtf(warp_sums[0] / dim + 1e-6f);
-  for (int i = tid; i < dim; i += blockDim.x) out[i] = x[i] * norm * weight[i];
-}
-
-/**
- * MatMul kernel (fp16 weight): out = x @ w^T
- * Grid:  (d + 255) / 256 个 block
- * Block: 256 个线程
- * 每个 thread 负责 out 的 1 个元素
- */
-__global__ void matmul_fp16_kernel(float* out, const float* x,
-                                   const uint16_t* w, int n, int d) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < d) {
-    float val = 0.0f;
-    for (int j = 0; j < n; j++) {
-      uint16_t h = w[i * n + j];
-      uint32_t sign = (h >> 15) & 0x1;
-      uint32_t exponent = (h >> 10) & 0x1f;
-      uint32_t mantissa = h & 0x3ff;
-      uint32_t f;
-      if (exponent == 0) {
-        f = (sign << 31) | (mantissa << 13);
-      } else if (exponent == 31) {
-        f = (sign << 31) | (0xff << 23) | (mantissa << 13);
-      } else {
-        f = (sign << 31) | ((exponent + 112) << 23) | (mantissa << 13);
-      }
-      val += x[j] * __uint_as_float(f);
-    }
-    out[i] = val;
+  for (int i = tid; i < dim; i += blockDim.x) {
+    out[i] = __float2half(__half2float(x[i]) * norm * weight[i]);
   }
 }
 
 /**
- * 把 fp32 向量转成 fp16
+ * Add bias kernel (fp32 bias 加到 fp16 向量上)
  * Grid:  (n + 255) / 256 个 block
  * Block: 256 个线程
  */
-__global__ void fp32_to_fp16_kernel(uint16_t* out, const float* in, int n) {
+__global__ void add_bias_kernel(__half* out, const float* bias, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) {
-    // out[i] = __float2half(in[i]);
-    // 用 __half 类型中转
-    __half h = __float2half(in[i]);
-    uint16_t result;
-    memcpy(&result, &h, sizeof(uint16_t));
-    out[i] = result;
-  }
-}
-
-__global__ void fp16_to_fp32_kernel(float* out, const uint16_t* in, int n) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) out[i] = __half2float(*((__half*)&in[i]));
-}
-
-void matmul_fp16_cublas(cublasHandle_t handle, float* out, const float* x,
-                        const uint16_t* w, int n, int d, uint16_t* x_fp16,
-                        uint16_t* out_fp16) {
-  int threads = 256;
-  fp32_to_fp16_kernel<<<(n + threads - 1) / threads, threads>>>(x_fp16, x, n);
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    fprintf(stderr, "fp32_to_fp16_kernel error: %s\n", cudaGetErrorString(err));
-  }
-  cudaDeviceSynchronize();
-  err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    fprintf(stderr, "after sync error: %s\n", cudaGetErrorString(err));
-  }
-
-  const __half alpha = __float2half(1.0f);
-  const __half beta = __float2half(0.0f);
-  cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, d, 1, n, &alpha,
-              (const __half*)w, n, (const __half*)x_fp16, n, &beta,
-              (__half*)out_fp16, d);
-  cudaDeviceSynchronize();
-
-  fp16_to_fp32_kernel<<<(d + threads - 1) / threads, threads>>>(out, out_fp16,
-                                                                d);
-  cudaDeviceSynchronize();
+  if (i < n) out[i] = __float2half(__half2float(out[i]) + bias[i]);
 }
 
 /**
- * Add bias kernel
- * Grid:  (n + 255) / 256 个 block
- * Block: 256 个线程
- * 每个 thread 负责 1 个元素
- */
-__global__ void add_bias_kernel(float* out, const float* bias, int n) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) out[i] += bias[i];
-}
-
-/**
- * RoPE kernel
+ * RoPE kernel (全 fp16)
  * Grid:  (dim/2 + 255) / 256 个 block
  * Block: 256 个线程
- * 每个 thread 负责一对元素的旋转
  */
-__global__ void rope_kernel(float* q, float* k, int pos, int dim, int kv_dim,
-                            int head_dim, int n_heads, int n_kv_heads,
-                            float rope_freq_base) {
+__global__ void rope_kernel(__half* q, __half* k, int pos, int dim, int kv_dim,
+                            int head_dim, float rope_freq_base) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int idx = i * 2;
 
@@ -339,9 +252,9 @@ __global__ void rope_kernel(float* q, float* k, int pos, int dim, int kv_dim,
     float theta = 1.0f / powf(rope_freq_base, 2.0f * pair / head_dim);
     float cos_v = cosf(theta * pos);
     float sin_v = sinf(theta * pos);
-    float q0 = q[idx], q1 = q[idx + 1];
-    q[idx] = q0 * cos_v - q1 * sin_v;
-    q[idx + 1] = q0 * sin_v + q1 * cos_v;
+    float q0 = __half2float(q[idx]), q1 = __half2float(q[idx + 1]);
+    q[idx] = __float2half(q0 * cos_v - q1 * sin_v);
+    q[idx + 1] = __float2half(q0 * sin_v + q1 * cos_v);
   }
 
   if (idx < kv_dim) {
@@ -349,21 +262,21 @@ __global__ void rope_kernel(float* q, float* k, int pos, int dim, int kv_dim,
     float theta = 1.0f / powf(rope_freq_base, 2.0f * pair / head_dim);
     float cos_v = cosf(theta * pos);
     float sin_v = sinf(theta * pos);
-    float k0 = k[idx], k1 = k[idx + 1];
-    k[idx] = k0 * cos_v - k1 * sin_v;
-    k[idx + 1] = k0 * sin_v + k1 * cos_v;
+    float k0 = __half2float(k[idx]), k1 = __half2float(k[idx + 1]);
+    k[idx] = __float2half(k0 * cos_v - k1 * sin_v);
+    k[idx + 1] = __float2half(k0 * sin_v + k1 * cos_v);
   }
 }
 
 /**
- * KV Cache 写入 kernel
+ * KV Cache 写入 kernel (fp16)
  * Grid:  (kv_dim + 255) / 256 个 block
  * Block: 256 个线程
- * 每个 thread 负责 1 个元素
  */
-__global__ void kvcache_write_kernel(float* k_cache, float* v_cache,
-                                     const float* k, const float* v, int layer,
-                                     int pos, int seq_len, int kv_dim) {
+__global__ void kvcache_write_kernel(__half* k_cache, __half* v_cache,
+                                     const __half* k, const __half* v,
+                                     int layer, int pos, int seq_len,
+                                     int kv_dim) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < kv_dim) {
     int offset = layer * seq_len * kv_dim + pos * kv_dim + i;
@@ -373,14 +286,13 @@ __global__ void kvcache_write_kernel(float* k_cache, float* v_cache,
 }
 
 /**
- * Attention kernel
+ * Attention kernel (fp16 kv cache，fp32 scores)
  * Grid:  n_heads 个 block
  * Block: 256 个线程
- * 每个 block 负责一个 head
- * shared memory: [seq_len] 存 attention scores
+ * shared memory: [seq_len] fp32 scores
  */
-__global__ void attention_kernel(const float* q, const float* k_cache,
-                                 const float* v_cache, float* out, int pos,
+__global__ void attention_kernel(const __half* q, const __half* k_cache,
+                                 const __half* v_cache, __half* out, int pos,
                                  int seq_len, int kv_dim, int head_dim,
                                  int kv_mul) {
   int h = blockIdx.x;
@@ -389,13 +301,14 @@ __global__ void attention_kernel(const float* q, const float* k_cache,
 
   extern __shared__ float scores[];
 
-  const float* q_head = q + h * head_dim;
+  const __half* q_head = q + h * head_dim;
 
   // Q @ K^T
   for (int t = tid; t <= pos; t += blockDim.x) {
-    const float* k_head = k_cache + t * kv_dim + (h / kv_mul) * head_dim;
+    const __half* k_head = k_cache + t * kv_dim + (h / kv_mul) * head_dim;
     float score = 0.0f;
-    for (int d = 0; d < head_dim; d++) score += q_head[d] * k_head[d];
+    for (int d = 0; d < head_dim; d++)
+      score += __half2float(q_head[d]) * __half2float(k_head[d]);
     scores[t] = score * scale;
   }
   __syncthreads();
@@ -414,40 +327,64 @@ __global__ void attention_kernel(const float* q, const float* k_cache,
   __syncthreads();
 
   // scores @ V
-  float* out_head = out + h * head_dim;
+  __half* out_head = out + h * head_dim;
   for (int d = tid; d < head_dim; d += blockDim.x) {
     float val = 0.0f;
     for (int t = 0; t <= pos; t++) {
-      const float* v_head = v_cache + t * kv_dim + (h / kv_mul) * head_dim;
-      val += scores[t] * v_head[d];
+      const __half* v_head = v_cache + t * kv_dim + (h / kv_mul) * head_dim;
+      val += scores[t] * __half2float(v_head[d]);
     }
-    out_head[d] = val;
+    out_head[d] = __float2half(val);
   }
 }
 
 /**
- * SwiGLU kernel: hb[i] = silu(hb[i]) * hb2[i]
+ * SwiGLU kernel (fp16)
  * Grid:  (hidden_dim + 255) / 256 个 block
  * Block: 256 个线程
- * 每个 thread 负责 1 个元素
  */
-__global__ void swiglu_kernel(float* hb, const float* hb2, int hidden_dim) {
+__global__ void swiglu_kernel(__half* hb, const __half* hb2, int hidden_dim) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < hidden_dim) {
-    float x = hb[i];
-    hb[i] = x * (1.0f / (1.0f + expf(-x))) * hb2[i];
+    float x = __half2float(hb[i]);
+    hb[i] = __float2half(x * (1.0f / (1.0f + expf(-x))) * __half2float(hb2[i]));
   }
 }
 
 /**
- * Residual add kernel: x[i] += delta[i]
+ * Residual add kernel (fp16)
  * Grid:  (dim + 255) / 256 个 block
  * Block: 256 个线程
- * 每个 thread 负责 1 个元素
  */
-__global__ void residual_kernel(float* x, const float* delta, int dim) {
+__global__ void residual_kernel(__half* x, const __half* delta, int dim) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < dim) x[i] += delta[i];
+  if (i < dim) x[i] = __float2half(__half2float(x[i]) + __half2float(delta[i]));
+}
+
+/**
+ * 最终 logits 输出：fp16 -> fp32
+ * Grid:  (vocab_size + 255) / 256 个 block
+ * Block: 256 个线程
+ */
+__global__ void fp16_to_fp32_kernel(float* out, const __half* in, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = __half2float(in[i]);
+}
+
+// ============================================================================
+// cublasHgemm 封装
+// ============================================================================
+
+/**
+ * matmul: out = x @ w^T
+ * x: [n] fp16, w: [d, n] fp16, out: [d] fp16
+ */
+static void matmul_half(cublasHandle_t handle, __half* out, const __half* x,
+                        const __half* w, int n, int d) {
+  const __half alpha = __float2half(1.0f);
+  const __half beta = __float2half(0.0f);
+  CHECK_CUBLAS(cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, d, 1, n, &alpha, w,
+                           n, x, n, &beta, out, d));
 }
 
 // ============================================================================
@@ -477,14 +414,8 @@ GPUDecoder::GPUDecoder(const std::string& model_file) {
   }
 
   upload_weights(gw, w, config);
-  CHECK_CUDA(cudaGetLastError());
   alloc_gpu_run_state(gs, config);
-  CHECK_CUDA(cudaGetLastError());
-  cublasStatus_t status = cublasCreate(&cublas_handle);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    fprintf(stderr, "cublasCreate failed: %d\n", status);
-    exit(1);
-  }
+  CHECK_CUBLAS(cublasCreate(&cublas_handle));
 }
 
 GPUDecoder::~GPUDecoder() {
@@ -516,12 +447,9 @@ void GPUDecoder::forward(int token, int pos) {
     rmsnorm_kernel<<<1, threads>>>(gs.xb, gs.x, gw.rms_att[l], dim);
 
     // 3. QKV 投影
-    matmul_fp16_cublas(cublas_handle, gs.q, gs.xb, gw.wq[l], dim, dim,
-                       gs.xb_fp16, gs.out_fp16);
-    matmul_fp16_cublas(cublas_handle, gs.k, gs.xb, gw.wk[l], dim, kv_dim,
-                       gs.xb_fp16, gs.out_fp16);
-    matmul_fp16_cublas(cublas_handle, gs.v, gs.xb, gw.wv[l], dim, kv_dim,
-                       gs.xb_fp16, gs.out_fp16);
+    matmul_half(cublas_handle, gs.q, gs.xb, gw.wq[l], dim, dim);
+    matmul_half(cublas_handle, gs.k, gs.xb, gw.wk[l], dim, kv_dim);
+    matmul_half(cublas_handle, gs.v, gs.xb, gw.wv[l], dim, kv_dim);
 
     // 4. 加 bias
     add_bias_kernel<<<(dim + threads - 1) / threads, threads>>>(gs.q, gw.bq[l],
@@ -533,8 +461,7 @@ void GPUDecoder::forward(int token, int pos) {
 
     // 5. RoPE
     rope_kernel<<<(dim / 2 + threads - 1) / threads, threads>>>(
-        gs.q, gs.k, pos, dim, kv_dim, head_dim, config.n_heads,
-        config.n_kv_heads, config.rope_freq_base);
+        gs.q, gs.k, pos, dim, kv_dim, head_dim, config.rope_freq_base);
 
     // 6. KV Cache 写入
     kvcache_write_kernel<<<(kv_dim + threads - 1) / threads, threads>>>(
@@ -548,8 +475,7 @@ void GPUDecoder::forward(int token, int pos) {
         config.seq_len, kv_dim, head_dim, kv_mul);
 
     // 8. 输出投影 + 残差
-    matmul_fp16_cublas(cublas_handle, gs.xb2, gs.xb, gw.wo[l], dim, dim,
-                       gs.xb_fp16, gs.out_fp16);
+    matmul_half(cublas_handle, gs.xb2, gs.xb, gw.wo[l], dim, dim);
     residual_kernel<<<(dim + threads - 1) / threads, threads>>>(gs.x, gs.xb2,
                                                                 dim);
 
@@ -557,16 +483,13 @@ void GPUDecoder::forward(int token, int pos) {
     rmsnorm_kernel<<<1, threads>>>(gs.xb, gs.x, gw.rms_ffn[l], dim);
 
     // 10. SwiGLU FFN
-    matmul_fp16_cublas(cublas_handle, gs.hb, gs.xb, gw.w1[l], dim,
-                       config.hidden_dim, gs.xb_fp16, gs.out_fp16);
-    matmul_fp16_cublas(cublas_handle, gs.hb2, gs.xb, gw.w3[l], dim,
-                       config.hidden_dim, gs.xb_fp16, gs.out_fp16);
+    matmul_half(cublas_handle, gs.hb, gs.xb, gw.w1[l], dim, config.hidden_dim);
+    matmul_half(cublas_handle, gs.hb2, gs.xb, gw.w3[l], dim, config.hidden_dim);
     swiglu_kernel<<<(config.hidden_dim + threads - 1) / threads, threads>>>(
         gs.hb, gs.hb2, config.hidden_dim);
 
     // 11. FFN 输出投影 + 残差
-    matmul_fp16_cublas(cublas_handle, gs.xb2, gs.hb, gw.w2[l],
-                       config.hidden_dim, dim, gs.xb_fp16, gs.out_fp16);
+    matmul_half(cublas_handle, gs.xb2, gs.hb, gw.w2[l], config.hidden_dim, dim);
     residual_kernel<<<(dim + threads - 1) / threads, threads>>>(gs.x, gs.xb2,
                                                                 dim);
   }
@@ -574,9 +497,11 @@ void GPUDecoder::forward(int token, int pos) {
   // 12. 最终 RMSNorm
   rmsnorm_kernel<<<1, threads>>>(gs.xb, gs.x, gw.rms_final, dim);
 
-  // 13. 输出 logits 到 pinned memory
-  matmul_fp16_cublas(cublas_handle, gs.logits, gs.xb, gw.wcls, dim,
-                     config.vocab_size, gs.xb_fp16, gs.out_fp16);
+  // 13. logits: fp16 matmul 然后转 fp32
+  matmul_half(cublas_handle, gs.logits_fp16, gs.xb, gw.wcls, dim,
+              config.vocab_size);
+  fp16_to_fp32_kernel<<<(config.vocab_size + threads - 1) / threads, threads>>>(
+      gs.logits, gs.logits_fp16, config.vocab_size);
 }
 
 int main(int argc, char** argv) {
@@ -585,7 +510,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  GPUDecoder* decoder = new GPUDecoder(argv[1]);
+  auto* decoder = new GPUDecoder(argv[1]);
 
   std::mt19937 rng(time(nullptr));
   float temperature = 0.7f;
@@ -595,7 +520,7 @@ int main(int argc, char** argv) {
   std::string user_input;
   printf("User: ");
   std::getline(std::cin, user_input);
-  fprintf(stderr, "%s\n", user_input.c_str());
+  std::cout << user_input << std::endl;
 
   decoder->generate(user_input, max_new_tokens, temperature, top_k, rng);
 

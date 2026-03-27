@@ -27,3 +27,5 @@ add_cuda_target(gpu_decoder_v1
     gpu_v1/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
 add_cuda_target(gpu_decoder_v2
     gpu_v2/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
+add_cuda_target(gpu_decoder_v3
+    gpu_v3/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
