@@ -16,6 +16,16 @@
     }                                                                         \
   }
 
+#define CHECK_KERNEL()                                                   \
+  {                                                                      \
+    cudaError_t err = cudaGetLastError();                                \
+    if (err != cudaSuccess) {                                            \
+      fprintf(stderr, "Kernel error at %s:%d: %s\n", __FILE__, __LINE__, \
+              cudaGetErrorString(err));                                  \
+      exit(1);                                                           \
+    }                                                                    \
+  }
+
 // ============================================================================
 // GPUWeights 上传/释放
 // ============================================================================
@@ -439,74 +449,95 @@ void GPUDecoder::forward(int token, int pos) {
   // 1. Embedding lookup
   embedding_kernel<<<(dim + threads - 1) / threads, threads>>>(
       gs.x, gw.token_embedding, token, dim);
+  CHECK_KERNEL();
 
   for (int l = 0; l < config.n_layers; l++) {
     // 2. RMSNorm
     rmsnorm_kernel<<<1, threads>>>(gs.xb, gs.x, gw.rms_att[l], dim);
+    CHECK_KERNEL();
 
     // 3. QKV 投影
     matmul_fp16_kernel<<<(dim + threads - 1) / threads, threads>>>(
         gs.q, gs.xb, gw.wq[l], dim, dim);
+    CHECK_KERNEL();
     matmul_fp16_kernel<<<(kv_dim + threads - 1) / threads, threads>>>(
         gs.k, gs.xb, gw.wk[l], dim, kv_dim);
+    CHECK_KERNEL();
     matmul_fp16_kernel<<<(kv_dim + threads - 1) / threads, threads>>>(
         gs.v, gs.xb, gw.wv[l], dim, kv_dim);
+    CHECK_KERNEL();
 
     // 4. 加 bias
     add_bias_kernel<<<(dim + threads - 1) / threads, threads>>>(gs.q, gw.bq[l],
                                                                 dim);
+    CHECK_KERNEL();
     add_bias_kernel<<<(kv_dim + threads - 1) / threads, threads>>>(
         gs.k, gw.bk[l], kv_dim);
+    CHECK_KERNEL();
     add_bias_kernel<<<(kv_dim + threads - 1) / threads, threads>>>(
         gs.v, gw.bv[l], kv_dim);
+    CHECK_KERNEL();
 
     // 5. RoPE
     rope_kernel<<<(dim / 2 + threads - 1) / threads, threads>>>(
         gs.q, gs.k, pos, dim, kv_dim, head_dim, config.n_heads,
         config.n_kv_heads, config.rope_freq_base);
+    CHECK_KERNEL();
 
     // 6. KV Cache 写入
     kvcache_write_kernel<<<(kv_dim + threads - 1) / threads, threads>>>(
         gs.k_cache, gs.v_cache, gs.k, gs.v, l, pos, config.seq_len, kv_dim);
+    CHECK_KERNEL();
 
     // 7. Attention
     attention_kernel<<<config.n_heads, threads>>>(
         gs.q, gs.k_cache + (size_t)l * config.seq_len * kv_dim,
         gs.v_cache + (size_t)l * config.seq_len * kv_dim, gs.xb, gs.att, pos,
         config.seq_len, kv_dim, head_dim, kv_mul);
+    CHECK_KERNEL();
 
     // 8. 输出投影 + 残差
     matmul_fp16_kernel<<<(dim + threads - 1) / threads, threads>>>(
         gs.xb2, gs.xb, gw.wo[l], dim, dim);
+    CHECK_KERNEL();
     residual_kernel<<<(dim + threads - 1) / threads, threads>>>(gs.x, gs.xb2,
                                                                 dim);
+    CHECK_KERNEL();
 
     // 9. FFN RMSNorm
     rmsnorm_kernel<<<1, threads>>>(gs.xb, gs.x, gw.rms_ffn[l], dim);
+    CHECK_KERNEL();
 
     // 10. SwiGLU FFN
     matmul_fp16_kernel<<<(config.hidden_dim + threads - 1) / threads,
                          threads>>>(gs.hb, gs.xb, gw.w1[l], dim,
                                     config.hidden_dim);
+    CHECK_KERNEL();
     matmul_fp16_kernel<<<(config.hidden_dim + threads - 1) / threads,
                          threads>>>(gs.hb2, gs.xb, gw.w3[l], dim,
                                     config.hidden_dim);
+    CHECK_KERNEL();
     swiglu_kernel<<<(config.hidden_dim + threads - 1) / threads, threads>>>(
         gs.hb, gs.hb2, config.hidden_dim);
+    CHECK_KERNEL();
 
     // 11. FFN 输出投影 + 残差
     matmul_fp16_kernel<<<(dim + threads - 1) / threads, threads>>>(
         gs.xb2, gs.hb, gw.w2[l], config.hidden_dim, dim);
+    CHECK_KERNEL();
     residual_kernel<<<(dim + threads - 1) / threads, threads>>>(gs.x, gs.xb2,
                                                                 dim);
+    CHECK_KERNEL();
   }
 
   // 12. 最终 RMSNorm
   rmsnorm_kernel<<<1, threads>>>(gs.xb, gs.x, gw.rms_final, dim);
+  CHECK_KERNEL();
 
   // 13. 输出 logits 到 pinned memory
   matmul_fp16_kernel<<<(config.vocab_size + threads - 1) / threads, threads>>>(
       gs.logits, gs.xb, gw.wcls, dim, config.vocab_size);
+  CHECK_KERNEL();
 }
 
 int main(int argc, char** argv) {
