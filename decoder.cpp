@@ -1,0 +1,46 @@
+#include "decoder.h"
+
+#include <cstdio>
+#include <vector>
+
+void Decoder::generate(const std::string& user_input, int max_new_tokens,
+                       float temperature, int top_k, std::mt19937& rng) {
+  // 套 chat template
+  std::string prompt = apply_chat_template(user_input);
+
+  // encode
+  std::vector<int> prompt_tokens;
+  encode(tokenizer, prompt, prompt_tokens);
+
+  // prefill BOS
+  int pos = 0;
+  forward(tokenizer.bos_token_id, pos++);
+
+  // prefill prompt
+  for (int i = 0; i < (int)prompt_tokens.size(); i++) {
+    if (pos >= config.seq_len) {
+      fprintf(stderr, "prompt too long\n");
+      return;
+    }
+    forward(prompt_tokens[i], pos++);
+  }
+
+  // 生成
+  printf("Assistant: ");
+  while (pos < config.seq_len &&
+         pos < max_new_tokens + (int)prompt_tokens.size() + 1) {
+    float* logits = get_logits();
+    int next_token =
+        sample_topk(logits, config.vocab_size, top_k, temperature, rng);
+
+    if (next_token == tokenizer.eos_token_id) break;
+    if (next_token == tokenizer.bos_token_id) break;
+    if (tokenizer.vocab[next_token] == "<|im_end|>") break;
+
+    printf("%s", decode(tokenizer, next_token));
+    fflush(stdout);
+
+    forward(next_token, pos++);
+  }
+  printf("\n");
+}

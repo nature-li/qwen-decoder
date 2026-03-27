@@ -9,4 +9,4 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Debug)
 endif()
 
-add_executable(gguf_info main.cpp gguf_loader.cpp common.cpp cpu_decoder.cpp)
+add_executable(gguf_info main.cpp gguf_loader.cpp common.cpp decoder.cpp cpu_decoder.cpp)

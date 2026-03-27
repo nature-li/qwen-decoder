@@ -1,5 +1,6 @@
 #pragma once
-#include "common.h"
+#include "decoder.h"
+#include "gguf_loader.h"
 
 struct RunState {
   float* x;        // [dim] 当前 token 的隐藏状态
@@ -16,7 +17,17 @@ struct RunState {
   float* v_cache;  // [n_layers, seq_len, kv_dim] Value Cache
 };
 
-void alloc_run_state(RunState& s, const Config& config);
-void free_run_state(RunState& s);
-void forward(const Config& config, const Weights& w, RunState& s, int token,
-             int pos);
+class CPUDecoder : public Decoder {
+ public:
+  CPUDecoder(const std::string& model_file);
+  ~CPUDecoder();
+
+  void forward(int token, int pos) override;
+  float* get_logits() override { return state.logits; }
+
+ private:
+  ModelFile mf;
+  GGUFFile gguf;
+  Weights w;
+  RunState state;
+};

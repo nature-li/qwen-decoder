@@ -259,7 +259,6 @@ int load_tokenizer(Tokenizer& t, const GGUFFile& gguf) {
     for (int i = 0; i < (int)arr.size(); i++) {
       t.merges[i] = arr[i].str;
     }
-    printf("merges size = %zu\n", t.merges.size());
   }
 
   // 读 token 类型
@@ -273,8 +272,6 @@ int load_tokenizer(Tokenizer& t, const GGUFFile& gguf) {
   }
 
   printf("vocab_size     = %d\n", t.vocab_size);
-  printf("bos_token_id   = %d\n", t.bos_token_id);
-  printf("eos_token_id   = %d\n", t.eos_token_id);
 
   return 0;
 }

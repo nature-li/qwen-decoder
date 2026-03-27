@@ -1,10 +1,13 @@
 #include "cpu_decoder.h"
 
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 
-void alloc_run_state(RunState& s, const Config& config) {
+// ============================================================================
+// RunState 分配/释放
+// ============================================================================
+
+static void alloc_run_state(RunState& s, const Config& config) {
   int dim = config.dim;
   int kv_dim = config.n_kv_heads * (config.dim / config.n_heads);
   int seq_len = config.seq_len;
@@ -23,7 +26,7 @@ void alloc_run_state(RunState& s, const Config& config) {
   s.v_cache = new float[config.n_layers * seq_len * kv_dim];
 }
 
-void free_run_state(RunState& s) {
+static void free_run_state(RunState& s) {
   delete[] s.x;
   delete[] s.xb;
   delete[] s.xb2;
@@ -38,62 +41,100 @@ void free_run_state(RunState& s) {
   delete[] s.v_cache;
 }
 
-// fp16 矩阵乘向量: out = x @ w^T
-// w 是 fp16，计算时转成 float
-void matmul_fp16(float* out, const float* x, const uint16_t* w, int n, int d) {
-  for (int i = 0; i < d; i++) {
-    float val = 0.0f;
-    for (int j = 0; j < n; j++) {
-      val += x[j] * fp16_to_float(w[i * n + j]);
-    }
-    out[i] = val;
-  }
-}
+// ============================================================================
+// 计算函数
+// ============================================================================
 
-// RMSNorm
-void rmsnorm(float* out, const float* x, const float* weight, int dim) {
+static void rmsnorm(float* out, const float* x, const float* weight, int dim) {
   float ss = 0.0f;
   for (int i = 0; i < dim; i++) ss += x[i] * x[i];
   ss = 1.0f / sqrtf(ss / dim + 1e-6f);
   for (int i = 0; i < dim; i++) out[i] = x[i] * ss * weight[i];
 }
 
-// SiLU
-float silu(float x) { return x * (1.0f / (1.0f + expf(-x))); }
-
-// fp16 embedding lookup，转成 float
-void embedding_lookup(float* out, const uint16_t* table, int token, int dim) {
-  const uint16_t* row = table + token * dim;
-  for (int i = 0; i < dim; i++) out[i] = fp16_to_float(row[i]);
+static void matmul_fp16(float* out, const float* x, const uint16_t* w, int n,
+                        int d) {
+  for (int i = 0; i < d; i++) {
+    float val = 0.0f;
+    for (int j = 0; j < n; j++) val += x[j] * fp16_to_float(w[i * n + j]);
+    out[i] = val;
+  }
 }
 
-void forward(const Config& config, const Weights& w, RunState& s, int token,
-             int pos) {
+static float silu(float x) { return x * (1.0f / (1.0f + expf(-x))); }
+
+// ============================================================================
+// CPUDecoder 实现
+// ============================================================================
+
+CPUDecoder::CPUDecoder(const std::string& model_file) {
+  // 加载 GGUF
+  if (load_gguf(gguf, model_file) != 0) {
+    fprintf(stderr, "failed to load gguf\n");
+    exit(1);
+  }
+
+  // 加载 Config
+  if (load_config(config, gguf) != 0) {
+    fprintf(stderr, "failed to load config\n");
+    exit(1);
+  }
+
+  // mmap 文件
+  if (open_model(model_file, mf) != 0) {
+    fprintf(stderr, "failed to open model\n");
+    exit(1);
+  }
+
+  // 加载权重
+  if (load_weights(w, config, gguf, mf) != 0) {
+    fprintf(stderr, "failed to load weights\n");
+    exit(1);
+  }
+
+  // 加载 tokenizer
+  if (load_tokenizer(tokenizer, gguf) != 0) {
+    fprintf(stderr, "failed to load tokenizer\n");
+    exit(1);
+  }
+
+  // 分配 RunState
+  alloc_run_state(state, config);
+}
+
+CPUDecoder::~CPUDecoder() {
+  free_run_state(state);
+  free_weights(w);
+  close_model(mf);
+}
+
+void CPUDecoder::forward(int token, int pos) {
   int dim = config.dim;
   int head_dim = config.dim / config.n_heads;
   int kv_dim = config.n_kv_heads * head_dim;
   int kv_mul = config.n_heads / config.n_kv_heads;
 
   // 1. Embedding lookup (fp16 -> float)
-  embedding_lookup(s.x, w.token_embedding, token, dim);
+  const uint16_t* row = w.token_embedding + token * dim;
+  for (int i = 0; i < dim; i++) state.x[i] = fp16_to_float(row[i]);
 
   for (int l = 0; l < config.n_layers; l++) {
     // 2. Attention 前 RMSNorm
-    rmsnorm(s.xb, s.x, w.rms_att[l], dim);
+    rmsnorm(state.xb, state.x, w.rms_att[l], dim);
 
     // 3. QKV 投影 (fp16 matmul)
-    matmul_fp16(s.q, s.xb, w.wq[l], dim, dim);
-    matmul_fp16(s.k, s.xb, w.wk[l], dim, kv_dim);
-    matmul_fp16(s.v, s.xb, w.wv[l], dim, kv_dim);
+    matmul_fp16(state.q, state.xb, w.wq[l], dim, dim);
+    matmul_fp16(state.k, state.xb, w.wk[l], dim, kv_dim);
+    matmul_fp16(state.v, state.xb, w.wv[l], dim, kv_dim);
 
     // 4. 加 bias
-    for (int i = 0; i < dim; i++) s.q[i] += w.bq[l][i];
-    for (int i = 0; i < kv_dim; i++) s.k[i] += w.bk[l][i];
-    for (int i = 0; i < kv_dim; i++) s.v[i] += w.bv[l][i];
+    for (int i = 0; i < dim; i++) state.q[i] += w.bq[l][i];
+    for (int i = 0; i < kv_dim; i++) state.k[i] += w.bk[l][i];
+    for (int i = 0; i < kv_dim; i++) state.v[i] += w.bv[l][i];
 
     // 5. RoPE 动态计算
     for (int h = 0; h < config.n_heads; h++) {
-      float* q_head = s.q + h * head_dim;
+      float* q_head = state.q + h * head_dim;
       for (int i = 0; i < head_dim / 2; i++) {
         float theta = 1.0f / powf(config.rope_freq_base, 2.0f * i / head_dim);
         float cos_val = cosf(theta * pos);
@@ -104,7 +145,7 @@ void forward(const Config& config, const Weights& w, RunState& s, int token,
       }
     }
     for (int h = 0; h < config.n_kv_heads; h++) {
-      float* k_head = s.k + h * head_dim;
+      float* k_head = state.k + h * head_dim;
       for (int i = 0; i < head_dim / 2; i++) {
         float theta = 1.0f / powf(config.rope_freq_base, 2.0f * i / head_dim);
         float cos_val = cosf(theta * pos);
@@ -116,16 +157,16 @@ void forward(const Config& config, const Weights& w, RunState& s, int token,
     }
 
     // 6. KV Cache 写入
-    float* k_cache_layer = s.k_cache + l * config.seq_len * kv_dim;
-    float* v_cache_layer = s.v_cache + l * config.seq_len * kv_dim;
-    memcpy(k_cache_layer + pos * kv_dim, s.k, kv_dim * sizeof(float));
-    memcpy(v_cache_layer + pos * kv_dim, s.v, kv_dim * sizeof(float));
+    float* k_cache_layer = state.k_cache + l * config.seq_len * kv_dim;
+    float* v_cache_layer = state.v_cache + l * config.seq_len * kv_dim;
+    memcpy(k_cache_layer + pos * kv_dim, state.k, kv_dim * sizeof(float));
+    memcpy(v_cache_layer + pos * kv_dim, state.v, kv_dim * sizeof(float));
 
     // 7. Attention
     float scale = 1.0f / sqrtf((float)head_dim);
     for (int h = 0; h < config.n_heads; h++) {
-      float* q_head = s.q + h * head_dim;
-      float* att_head = s.att + h * config.seq_len;
+      float* q_head = state.q + h * head_dim;
+      float* att_head = state.att + h * config.seq_len;
 
       for (int t = 0; t <= pos; t++) {
         float* k_head = k_cache_layer + t * kv_dim + (h / kv_mul) * head_dim;
@@ -143,7 +184,7 @@ void forward(const Config& config, const Weights& w, RunState& s, int token,
       }
       for (int t = 0; t <= pos; t++) att_head[t] /= sum;
 
-      float* out_head = s.xb + h * head_dim;
+      float* out_head = state.xb + h * head_dim;
       memset(out_head, 0, head_dim * sizeof(float));
       for (int t = 0; t <= pos; t++) {
         float* v_head = v_cache_layer + t * kv_dim + (h / kv_mul) * head_dim;
@@ -153,26 +194,27 @@ void forward(const Config& config, const Weights& w, RunState& s, int token,
     }
 
     // 8. Attention 输出投影 + 残差
-    matmul_fp16(s.xb2, s.xb, w.wo[l], dim, dim);
-    for (int i = 0; i < dim; i++) s.x[i] += s.xb2[i];
+    matmul_fp16(state.xb2, state.xb, w.wo[l], dim, dim);
+    for (int i = 0; i < dim; i++) state.x[i] += state.xb2[i];
 
     // 9. FFN 前 RMSNorm
-    rmsnorm(s.xb, s.x, w.rms_ffn[l], dim);
+    rmsnorm(state.xb, state.x, w.rms_ffn[l], dim);
 
     // 10. SwiGLU FFN
-    matmul_fp16(s.hb, s.xb, w.w1[l], dim, config.hidden_dim);
-    matmul_fp16(s.hb2, s.xb, w.w3[l], dim, config.hidden_dim);
-    for (int i = 0; i < config.hidden_dim; i++)
-      s.hb[i] = silu(s.hb[i]) * s.hb2[i];
+    matmul_fp16(state.hb, state.xb, w.w1[l], dim, config.hidden_dim);
+    matmul_fp16(state.hb2, state.xb, w.w3[l], dim, config.hidden_dim);
+    for (int i = 0; i < config.hidden_dim; i++) {
+      state.hb[i] = silu(state.hb[i]) * state.hb2[i];
+    }
 
     // 11. FFN 输出投影 + 残差
-    matmul_fp16(s.xb2, s.hb, w.w2[l], config.hidden_dim, dim);
-    for (int i = 0; i < dim; i++) s.x[i] += s.xb2[i];
+    matmul_fp16(state.xb2, state.hb, w.w2[l], config.hidden_dim, dim);
+    for (int i = 0; i < dim; i++) state.x[i] += state.xb2[i];
   }
 
   // 12. 最终 RMSNorm
-  rmsnorm(s.xb, s.x, w.rms_final, dim);
+  rmsnorm(state.xb, state.x, w.rms_final, dim);
 
   // 13. 输出 logits
-  matmul_fp16(s.logits, s.xb, w.wcls, dim, config.vocab_size);
+  matmul_fp16(state.logits, state.xb, w.wcls, dim, config.vocab_size);
 }
