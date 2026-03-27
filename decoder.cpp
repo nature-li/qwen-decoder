@@ -1,5 +1,6 @@
 #include "decoder.h"
 
+#include <chrono>
 #include <cstdio>
 #include <vector>
 
@@ -25,6 +26,10 @@ void Decoder::generate(const std::string& user_input, int max_new_tokens,
     forward(prompt_tokens[i], pos++);
   }
 
+  // 生成阶段开始计时
+  int n_generated = 0;
+  auto t_start = std::chrono::steady_clock::now();
+
   // 生成
   printf("Assistant: ");
   while (pos < config.seq_len &&
@@ -41,6 +46,12 @@ void Decoder::generate(const std::string& user_input, int max_new_tokens,
     fflush(stdout);
 
     forward(next_token, pos++);
+    n_generated++;
   }
   printf("\n");
+
+  auto t_end = std::chrono::steady_clock::now();
+  double elapsed = std::chrono::duration<double>(t_end - t_start).count();
+  fprintf(stderr, "\n%.2f tokens/s (%d tokens in %.2fs)\n",
+          n_generated / elapsed, n_generated, elapsed);
 }

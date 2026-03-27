@@ -20,6 +20,7 @@ int main(int argc, char** argv) {
   std::string user_input;
   printf("User: ");
   std::getline(std::cin, user_input);
+  fprintf(stderr, "%s\n", user_input.c_str());
 
   decoder.generate(user_input, max_new_tokens, temperature, top_k, rng);
 
