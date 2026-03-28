@@ -25,7 +25,36 @@ void softmax(float* x, int n) {
   }
 }
 
-int main() {
+void online_softmax(float* x, int n, int block_size) {
+  float m = -INFINITY;  // 当前全局最大值
+  float d = 0.0f;       // 当前分母 sum(exp)
+
+  for (int start = 0; start < n; start += block_size) {
+    // 更新全局最大值
+    float m_new =
+        *std::max_element(x + start, x + std::min(start + block_size, n));
+    m_new = std::max(m_new, m);
+
+    // 修正旧的 d, 换算到新的 base
+    float correction = expf(m - m_new);
+
+    // 旧的 d 修正后加上新块的贡献
+    d = d * correction;
+    for (int i = 0; i < block_size; i++) {
+      if (start + i < n) {
+        d += expf(x[start + i] - m_new);
+      }
+    }
+    m = m_new;
+  }
+
+  // 最终归一化
+  for (int i = 0; i < n; i++) {
+    x[i] = expf(x[i] - m) / d;
+  }
+}
+
+void test_softmax() {
   float x[4] = {1.0f, 2.0f, 3.0f, 4.0f};
   softmax(x, 4);
 
@@ -35,6 +64,22 @@ int main() {
     sum += x[i];
   }
   std::cout << "sum  = " << sum << "\n";
+}
 
+void test_online_softmax() {
+  float x[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+  online_softmax(x, 4, 3);
+
+  float sum = 0.0f;
+  for (int i = 0; i < 4; i++) {
+    std::cout << "y[" << i << "] = " << x[i] << "\n";
+    sum += x[i];
+  }
+  std::cout << "sum  = " << sum << "\n";
+}
+
+int main() {
+  test_softmax();
+  test_online_softmax();
   return 0;
 }
