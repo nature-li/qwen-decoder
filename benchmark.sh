@@ -19,3 +19,8 @@ echo "$PROMPT" | $BUILD_DIR/gpu_decoder_v2 $MODEL
 echo ""
 echo "=== GPU v3 ==="
 echo "$PROMPT" | $BUILD_DIR/gpu_decoder_v3 $MODEL
+
+
+echo ""
+echo "=== GPU v4 ==="
+echo "$PROMPT" | $BUILD_DIR/gpu_decoder_v4 $MODEL
