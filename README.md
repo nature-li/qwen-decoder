@@ -10,6 +10,7 @@
 | `common.cpp` | 公共函数（GGUF 加载、BPE tokenizer、采样） |
 | `gguf_loader.h/cpp` | GGUF 文件格式解析 |
 | `decoder.h/cpp` | Decoder 基类，generate 逻辑 |
+| `scheduler.h/cpp` | 请求调度器，continuous batching 核心 |
 | `cpu_decoder.h/cpp` | CPU 版本实现 |
 | `gpu_v1/` | GPU 朴素版本，手写 fp16 matmul kernel |
 | `gpu_v2/` | GPU v2，cublasHgemm 替换手写 kernel |
@@ -17,7 +18,8 @@
 | `gpu_v4/` | GPU v4，Flash Attention decode 阶段 |
 | `gpu_v5/` | GPU v5，batch prefill + standard attention |
 | `gpu_v6/` | GPU v6，batch prefill + flash attention prefill |
-| `gpu_v7/` | GPU v7，多请求并发 batch decode |
+| `gpu_v7/` | GPU v7，fixed batch decode，多请求并发 |
+| `gpu_v8/` | GPU v8，continuous batching，动态请求调度 |
 | `tests/` | softmax / attention 算法对比实现 |
 | `doc/` | nsys profile 截图 |
 | `CMakeLists.txt` | 构建配置 |
@@ -102,8 +104,11 @@ snapshot_download(
 # 单请求
 ./gpu_decoder_v6 qwen2.5-3b-instruct-fp16.gguf
 
-# 多请求并发（batch_size=4）
+# fixed batch 多请求并发（batch_size=4）
 ./gpu_decoder_v7 qwen2.5-3b-instruct-fp16.gguf 4
+
+# continuous batching（max_batch=4，请求数量可超过 max_batch）
+./gpu_decoder_v8 qwen2.5-3b-instruct-fp16.gguf 4
 ```
 
 ## 性能对比（Qwen2.5-3B，RTX 5060 Ti 16GB）
@@ -119,7 +124,8 @@ snapshot_download(
 | GPU v4 | ~45 | Flash Attention decode 阶段（无提升） |
 | GPU v5 | ~46 | batch prefill + standard attention |
 | GPU v6 | ~46 | batch prefill + flash attention prefill |
-| GPU v7 | ~87 | 4请求并发 batch decode，总吞吐约 2x |
+| GPU v7 | ~87 | fixed batch decode，4请求并发，总吞吐约 2x |
+| GPU v8 | ~87 | continuous batching，GPU 利用率从 27% 提升到 87% |
 
 ### prefill 阶段对比（prompt=3528 tokens）
 
@@ -131,11 +137,11 @@ snapshot_download(
 
 ### batch decode 对比（4请求并发，短 prompt）
 
-| 指标 | 单请求（v6） | 4请求并发（v7） |
-| :--- | :--- | :--- |
-| 总吞吐 | ~46 tokens/s | ~87 tokens/s |
-| 每请求速度 | ~46 tokens/s | ~22 tokens/s |
-| GPU 利用率 | 低（decode 是 memory-bound） | 更高 |
+| 指标 | 单请求（v6） | fixed batch（v7） | continuous batching（v8） |
+| :--- | :--- | :--- | :--- |
+| 总吞吐 | ~46 tokens/s | ~87 tokens/s | ~87 tokens/s |
+| GPU Kernels 占比 | ~49% | ~27% | ~87% |
+| GPU Memory 占比 | ~51% | ~73% | ~13% |
 
 ## 优化分析
 
@@ -259,45 +265,58 @@ attention_kernel: 2.0%
 
 ---
 
-### GPU v6 → v7（batch decode，多请求并发）
+### GPU v6 → v7（fixed batch decode，总吞吐 2x）
 
-实现 fixed batch decode，支持多请求同时推理：
+实现 fixed batch decode，支持多请求同时推理。每个请求有独立的 KV cache 和 pos，attention 时只看自己的 KV cache 槽。
+
+**v7 nsys profile：**
+
+![nsys v7](doc/nsys-v7.png)
 
 ```
-单请求 decode：
-  每个 step 处理 1 个 token
-  matmul [1, dim] × [dim, dim] → gemv，GPU 利用率低
-
-batch decode（4请求）：
-  每个 step 处理 4 个 token（每个请求各一个）
-  matmul [4, dim] × [dim, dim] → gemm，GPU 利用率更高
+Kernels: 27.0%，Memory: 73.0%
 ```
 
-核心改动：
+**Memory 高达 73% 的原因：** fixed batch 里请求长度不齐，短的请求完成后槽位空着，实际 batch size 退化为 1-2，matmul 退化成 gemv，变成 memory-bound。
 
-**每个请求独立的 KV cache：**
-```
-单请求: k_cache[n_layers, seq_len, kv_dim]
-batch:  k_cache[max_batch, n_layers, seq_len, kv_dim]
-attention 时每个请求只看自己的 KV cache 槽
-```
+---
 
-**每个请求独立的 pos：**
-```
-单请求: rope 和 kvcache 写入用同一个 pos
-batch:  positions[batch_size]，每个请求有自己的当前位置
-```
+### GPU v7 → v8（continuous batching，GPU 利用率 87%）
 
-**性能结果（4请求并发）：**
+实现 Scheduler，完成的请求立即让出槽位给等待队列里的新请求，GPU 始终满载：
+
 ```
-单请求:    ~46 tokens/s
-4请求并发: ~87 tokens/s 总吞吐（约 2x）
-每请求:    ~22 tokens/s
+fixed batch（v7）：
+  step1: [req0, req1, req2, req3]
+  step2: [req0, req1, ----, req3]  ← req2 完成，槽位空着浪费
+  step3: [req0, ----, ----, req3]  ← 继续浪费
+
+continuous batching（v8）：
+  step1: [req0, req1, req2, req3]
+  step2: [req0, req1, req4, req3]  ← req2 完成，req4 立即填入
+  step3: [req0, req5, req4, req3]  ← req1 完成，req5 立即填入
 ```
 
-总吞吐提升约 2x，因为 batch matmul 让 GPU 利用率更高。每个请求的速度下降是正常的，资源被多个请求共享。
+**v8 nsys profile：**
 
-**当前实现是 fixed batch：** 即使某个请求已完成，其槽位仍参与计算（结果被丢弃）。生产环境的 continuous batching（如 vLLM）会动态调度，完成的请求立即让出槽位给新请求，GPU 始终处理有效请求。
+![nsys v8](doc/nsys-v8.png)
+
+```
+Kernels: 86.8%，Memory: 13.2%
+attention_batch_kernel: 8.6%
+```
+
+**v7 vs v8 对比：**
+
+```
+              v7（fixed batch）   v8（continuous batching）
+Kernels:      27.0%              86.8%  ← GPU 利用率提升 3x
+Memory:       73.0%              13.2%  ← HBM 读写压力大幅下降
+```
+
+v8 的 GPU 始终在做有效计算，内存等待极少，是目前实现中 GPU 利用率最高的版本。
+
+与 vLLM 的 continuous batching 的区别：我们的实现是简化版，KV cache 仍然是静态预分配的。vLLM 用 PagedAttention 实现动态 KV cache 分配，彻底解决显存碎片问题，支持更大的并发数。
 
 ## Attention shared memory 限制
 
