@@ -542,3 +542,11 @@ int main(int argc, char** argv) {
   delete decoder;
   return 0;
 }
+
+void GPUDecoder::forward_prefill(const int* tokens, int n_tokens,
+                                 int start_pos) {
+  int pos = start_pos;
+  for (int i = 0; i < n_tokens; i++) {
+    forward(tokens[pos], pos++);
+  }
+}

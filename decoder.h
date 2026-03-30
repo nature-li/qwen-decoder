@@ -9,6 +9,7 @@ class Decoder {
  public:
   virtual ~Decoder() = default;
   virtual void forward(int token, int pos) = 0;
+  virtual void forward_prefill(const int* tokens, int n_tokens, int start_pos) = 0;
   virtual float* get_logits() = 0;
   void generate(const std::string& user_input, int max_new_tokens,
                 float temperature, int top_k, std::mt19937& rng);

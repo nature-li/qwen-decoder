@@ -27,19 +27,31 @@ struct GPUWeights {
 
 // GPU 上的运行时缓冲区
 struct GPURunState {
-  __half* x;        // [dim]
-  __half* xb;       // [dim]
-  __half* xb2;      // [dim]
-  __half* q;        // [dim]
-  __half* k;        // [kv_dim]
-  __half* v;        // [kv_dim]
-  float* att;       // [n_heads, seq_len] fp32 (softmax 需要精度)
-  __half* hb;       // [hidden_dim]
-  __half* hb2;      // [hidden_dim]
-  float* logits;    // [vocab_size] pinned memory
-  __half* k_cache;  // [n_layers, seq_len, kv_dim]
-  __half* v_cache;  // [n_layers, seq_len, kv_dim]
+  __half* x;            // [dim]
+  __half* xb;           // [dim]
+  __half* xb2;          // [dim]
+  __half* q;            // [dim]
+  __half* k;            // [kv_dim]
+  __half* v;            // [kv_dim]
+  float* att;           // [n_heads, seq_len] fp32 (softmax 需要精度)
+  __half* hb;           // [hidden_dim]
+  __half* hb2;          // [hidden_dim]
+  float* logits;        // [vocab_size] pinned memory
+  __half* k_cache;      // [n_layers, seq_len, kv_dim]
+  __half* v_cache;      // [n_layers, seq_len, kv_dim]
   __half* logits_fp16;  // [vocab_size] 临时 fp16 logits
+
+  /**
+   * prefill 阶段(多 token), 大小 = max_prefill * 对应维度
+   */
+  __half* x_pre;    // [max_prefill, dim]
+  __half* xb_pre;   // [max_prefill, dim]
+  __half* xb2_pre;  // [max_prefill, dim]
+  __half* q_pre;    // [max_prefill, dim]
+  __half* k_pre;    // [max_prefill, kv_dim]
+  __half* v_pre;    // [max_prefill, kv_dim]
+  __half* hb_pre;   // [max_prefill, hidden_dim]
+  __half* hb2_pre;  // [max_prefill, hidden_dim]
 };
 
 class GPUDecoder : public Decoder {

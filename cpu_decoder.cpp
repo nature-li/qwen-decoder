@@ -218,3 +218,11 @@ void CPUDecoder::forward(int token, int pos) {
   // 13. 输出 logits
   matmul_fp16(state.logits, state.xb, w.wcls, dim, config.vocab_size);
 }
+
+void CPUDecoder::forward_prefill(const int* tokens, int n_tokens,
+                                 int start_pos) {
+  int pos = start_pos;
+  for (int i = 0; i < n_tokens; i++) {
+    forward(tokens[pos], pos++);
+  }
+}

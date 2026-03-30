@@ -49,6 +49,7 @@ class GPUDecoder : public Decoder {
   ~GPUDecoder();
 
   void forward(int token, int pos) override;
+  void forward_prefill(const int* tokens, int n_tokens, int start_pos) override;
   float* get_logits() override;
 
  private:

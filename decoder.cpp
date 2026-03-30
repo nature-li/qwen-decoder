@@ -18,13 +18,12 @@ void Decoder::generate(const std::string& user_input, int max_new_tokens,
   forward(tokenizer.bos_token_id, pos++);
 
   // prefill prompt
-  for (int i = 0; i < (int)prompt_tokens.size(); i++) {
-    if (pos >= config.seq_len) {
-      fprintf(stderr, "prompt too long\n");
-      return;
-    }
-    forward(prompt_tokens[i], pos++);
+  if (pos + (int)prompt_tokens.size() >= config.seq_len) {
+    fprintf(stderr, "prompt too long\n");
+    return;
   }
+  forward_prefill(prompt_tokens.data(), (int)prompt_tokens.size(), pos);
+  pos += (int)prompt_tokens.size();
 
   // 生成阶段开始计时
   int n_generated = 0;
