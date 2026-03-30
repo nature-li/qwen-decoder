@@ -21,17 +21,19 @@ macro(add_cuda_target target)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 endmacro()
 
-add_executable(cpu_decoder cpu_main.cpp gguf_loader.cpp common.cpp decoder.cpp cpu_decoder.cpp)
+# add_executable(cpu_decoder cpu_main.cpp gguf_loader.cpp common.cpp decoder.cpp cpu_decoder.cpp)
 
-add_cuda_target(gpu_decoder_v1
-    gpu_v1/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
-add_cuda_target(gpu_decoder_v2
-    gpu_v2/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
-add_cuda_target(gpu_decoder_v3
-    gpu_v3/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
-add_cuda_target(gpu_decoder_v4
-    gpu_v4/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
-add_cuda_target(gpu_decoder_v5
-    gpu_v5/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
-add_cuda_target(gpu_decoder_v6
-    gpu_v6/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
+# add_cuda_target(gpu_decoder_v1
+#     gpu_v1/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
+# add_cuda_target(gpu_decoder_v2
+#     gpu_v2/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
+# add_cuda_target(gpu_decoder_v3
+#     gpu_v3/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
+# add_cuda_target(gpu_decoder_v4
+#     gpu_v4/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
+# add_cuda_target(gpu_decoder_v5
+#     gpu_v5/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
+# add_cuda_target(gpu_decoder_v6
+#     gpu_v6/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
+add_cuda_target(gpu_decoder_v7
+    gpu_v7/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
