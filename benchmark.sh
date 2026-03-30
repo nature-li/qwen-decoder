@@ -3,10 +3,10 @@
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 BUILD_DIR=$SCRIPT_DIR/build
 MODEL=$SCRIPT_DIR/qwen2.5-3b-instruct-fp16.gguf
-PROMPT="who are you? could you tell me a joke?"
+PROMPT="请把下面这段文字翻译成英文：人工智能（AI）是计算机科学的一个分支，致力于创建能够执行通常需要人类智能的任务的系统。"
 
-# echo "=== CPU ==="
-# echo "$PROMPT" | $BUILD_DIR/cpu_decoder $MODEL
+echo "=== CPU ==="
+echo "$PROMPT" | $BUILD_DIR/cpu_decoder $MODEL
 
 echo ""
 echo "=== GPU v1 ==="

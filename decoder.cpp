@@ -18,12 +18,20 @@ void Decoder::generate(const std::string& user_input, int max_new_tokens,
   forward(tokenizer.bos_token_id, pos++);
 
   // prefill prompt
+  auto t_prefill_start = std::chrono::steady_clock::now();
   if (pos + (int)prompt_tokens.size() >= config.seq_len) {
     fprintf(stderr, "prompt too long\n");
     return;
   }
   forward_prefill(prompt_tokens.data(), (int)prompt_tokens.size(), pos);
   pos += (int)prompt_tokens.size();
+
+  auto t_prefill_end = std::chrono::steady_clock::now();
+  double prefill_time =
+      std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
+  fprintf(stderr, "prefill: %d tokens in %.3fs (%.1f tokens/s)\n",
+          (int)prompt_tokens.size(), prefill_time,
+          prompt_tokens.size() / prefill_time);
 
   // 生成阶段开始计时
   int n_generated = 0;
