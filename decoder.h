@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "common.h"
+#include "scheduler.h"
 
 class Decoder {
  public:
@@ -19,6 +20,9 @@ class Decoder {
   void generate_batch(const std::vector<std::string>& user_inputs,
                       int max_new_tokens, float temperature, int top_k,
                       std::mt19937& rng);
+  void generate_continuous(std::vector<std::string>& user_inputs, int max_batch,
+                           int max_new_tokens, float temperature, int top_k,
+                           std::mt19937& rng);
 
  protected:
   Config config;
