@@ -19,23 +19,24 @@
     }                                                                         \
   }
 
-#define CHECK_CUBLAS(call)                                                \
-  {                                                                       \
-    cublasStatus_t status = call;                                         \
-    if (status != CUBLAS_STATUS_SUCCESS) {                                \
-      fprintf(stderr, "cuBLAS Error: %d at line %d\n", status, __LINE__); \
-      exit(1);                                                            \
-    }                                                                     \
+#define CHECK_CUBLAS(call)                                                  \
+  {                                                                         \
+    cublasStatus_t status = call;                                           \
+    if (status != CUBLAS_STATUS_SUCCESS) {                                  \
+      fprintf(stderr, "cuBLAS Error at %s:%d: %d:%s\n", __FILE__, __LINE__, \
+              status, cublasGetStatusString(status));                       \
+      exit(1);                                                              \
+    }                                                                       \
   }
 
-#define CHECK_KERNEL()                                                   \
-  {                                                                      \
-    cudaError_t err = cudaGetLastError();                                \
-    if (err != cudaSuccess) {                                            \
-      fprintf(stderr, "Kernel error at %s:%d: %s\n", __FILE__, __LINE__, \
-              cudaGetErrorString(err));                                  \
-      exit(1);                                                           \
-    }                                                                    \
+#define CHECK_KERNEL()                                                      \
+  {                                                                         \
+    cudaError_t err = cudaGetLastError();                                   \
+    if (err != cudaSuccess) {                                               \
+      fprintf(stderr, "Kernel error at %s:%d: %d:%s\n", __FILE__, __LINE__, \
+              err, cudaGetErrorString(err));                                \
+      exit(1);                                                              \
+    }                                                                       \
   }
 
 // ============================================================================
@@ -483,138 +484,93 @@ __global__ void fp16_to_fp32_kernel(float* out, const __half* in, int n) {
 }
 
 /**
- * Flash Attention Kernel (prefill 阶段)
+ * Standard Attention prefill kernel
  * Grid: dim3(n_heads, n_tokens)
  * Block: 256 个线程
  *
- * q: [n_tokens, dim]
- * k_cache: [seq_len, kv_dim]
- * v_cache: [seq_len, kv_dim]
- * out: [n_tokens, dim]
- *
- * 每个 block 负责一个 (query_token, head) 对
- * casual mask: 第 q_tok 个 token 只能看 <= start_pos + q_tok 的 kv
+ * scores 写到全局内存 att，需要 HBM 读写
+ * att: [n_tokens, n_heads, seq_len]
  */
-__global__ void flash_attention_prefill_kernel(
+__global__ void standard_attention_prefill_kernel(
     const __half* q, const __half* k_cache, const __half* v_cache, __half* out,
-    int start_pos, int seq_len, int dim, int kv_dim, int head_dim, int kv_mul) {
-  extern __shared__ float smem[];
-  float* s_block = smem;                 // [FA_BLOCK_SIZE]
-  float* o_smem = smem + FA_BLOCK_SIZE;  //[head_dim]
-  float* warp_m = o_smem + head_dim;     // [8]
-  float* warp_d = warp_m + 8;            // [8]
-  float* g_m = warp_d + 8;               // [1]
-  float* g_d = g_m + 1;                  // [1]
+    float* att, int start_pos, int seq_len, int dim, int kv_dim, int head_dim,
+    int kv_mul) {
+  __shared__ float warp_max[8];
+  __shared__ float warp_sum[8];
 
-  int h = blockIdx.x;      // head index
-  int q_tok = blockIdx.y;  // query token index in this prefill batch
+  int h = blockIdx.x;
+  int q_tok = blockIdx.y;
   int tid = threadIdx.x;
   int warp_id = tid / 32;
   int lane_id = tid % 32;
   int kv_head = h / kv_mul;
   float scale = rsqrtf((float)head_dim);
 
-  // 当前 query token 在整个序列里的绝对位置
   int cur_pos = start_pos + q_tok;
+  int kv_end = cur_pos + 1;
+  int n_heads = gridDim.x;
 
-  // q 布局: [n_tokens, dim], dim = n_heads * head_dim
   const __half* q_head = q + q_tok * dim + h * head_dim;
 
-  // 初始化
-  for (int d = tid; d < head_dim; d += blockDim.x) {
-    o_smem[d] = 0.0f;
-  }
-  if (tid == 0) {
-    *g_m = -CUDART_INF_F;
-    *g_d = 0.0f;
+  // scores 区域：[q_tok, h, 0..cur_pos]
+  float* scores = att + (q_tok * n_heads + h) * kv_end;
+
+  // 1. Q @ K^T → scores（写到全局内存 HBM）
+  for (int t = tid; t < kv_end; t += blockDim.x) {
+    const __half* k_head = k_cache + t * kv_dim + kv_head * head_dim;
+    float s = 0.0f;
+    for (int d = 0; d < head_dim; d++)
+      s += __half2float(q_head[d]) * __half2float(k_head[d]);
+    scores[t] = s * scale;
   }
   __syncthreads();
 
-  // casual mask: 只看到 0 到 cur_pos 的 k/v
-  int kv_end = cur_pos + 1;
+  // 2. softmax（从 HBM 读 scores，写回 HBM）
+  float local_max = -CUDART_INF_F;
+  for (int t = tid; t < kv_end; t += blockDim.x)
+    local_max = fmaxf(local_max, scores[t]);
 
-  for (int start = 0; start < kv_end; start += FA_BLOCK_SIZE) {
-    int end = min(start + FA_BLOCK_SIZE, kv_end);
-    int len = end - start;
+  local_max = warp_reduce_max(local_max);
+  if (lane_id == 0) warp_max[warp_id] = local_max;
+  __syncthreads();
 
-    // 1.计算块内 scores
-    for (int i = tid; i < len; i += blockDim.x) {
-      int t = start + i;
-      const __half* k_head = k_cache + t * kv_dim + kv_head * head_dim;
-      float s = 0.0f;
-      for (int d = 0; d < head_dim; d++) {
-        s += __half2float(q_head[d]) * __half2float(k_head[d]);
-      }
-      s_block[i] = s * scale;
-    }
-    __syncthreads();
+  if (warp_id == 0) {
+    float val = (lane_id < 8) ? warp_max[lane_id] : -CUDART_INF_F;
+    val = warp_reduce_max(val);
+    if (lane_id == 0) warp_max[0] = val;
+  }
+  __syncthreads();
 
-    // 2.块内最大规约
-    float local_max = -CUDART_INF_F;
-    for (int i = tid; i < len; i += blockDim.x) {
-      local_max = fmaxf(local_max, s_block[i]);
-    }
-    local_max = warp_reduce_max(local_max);
-    if (lane_id == 0) {
-      warp_m[warp_id] = local_max;
-    }
-    __syncthreads();
-
-    if (warp_id == 0) {
-      float val = (lane_id < 8) ? warp_m[lane_id] : -CUDART_INF_F;
-      val = warp_reduce_max(val);
-      if (lane_id == 0) {
-        warp_m[0] = val;
-      }
-    }
-    __syncthreads();
-
-    // 3.online softmax 更新 m 和 d
-    float m_new = fmaxf(*g_m, warp_m[0]);
-    float correction = expf(*g_m - m_new);
-
-    float local_d = 0.0f;
-    for (int i = tid; i < len; i += blockDim.x) {
-      local_d += expf(s_block[i] - m_new);
-    }
-    local_d = warp_reduce_sum(local_d);
-    if (lane_id == 0) {
-      warp_d[warp_id] = local_d;
-    }
-    __syncthreads();
-
-    if (warp_id == 0) {
-      float val = (lane_id < 8) ? warp_d[lane_id] : 0.0f;
-      val = warp_reduce_sum(val);
-      if (lane_id == 0) {
-        warp_d[0] = val;
-      }
-    }
-    __syncthreads();
-
-    if (tid == 0) {
-      *g_d = (*g_d) * correction + warp_d[0];
-      *g_m = m_new;
-    }
-    __syncthreads();
-
-    // 4.更新输出
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-      o_smem[d] *= correction;
-      for (int i = 0; i < len; i++) {
-        int t = start + i;
-        const __half* v_head = v_cache + t * kv_dim + kv_head * head_dim;
-        o_smem[d] += expf(s_block[i] - m_new) * __half2float(v_head[d]);
-      }
-    }
-    __syncthreads();
+  float max_val = warp_max[0];
+  float local_sum = 0.0f;
+  for (int t = tid; t < kv_end; t += blockDim.x) {
+    scores[t] = expf(scores[t] - max_val);
+    local_sum += scores[t];
   }
 
-  // 5.归一化
+  local_sum = warp_reduce_sum(local_sum);
+  if (lane_id == 0) warp_sum[warp_id] = local_sum;
+  __syncthreads();
+
+  if (warp_id == 0) {
+    float val = (lane_id < 8) ? warp_sum[lane_id] : 0.0f;
+    val = warp_reduce_sum(val);
+    if (lane_id == 0) warp_sum[0] = val;
+  }
+  __syncthreads();
+
+  float sum = warp_sum[0];
+  for (int t = tid; t < kv_end; t += blockDim.x) scores[t] /= sum;
+  __syncthreads();
+
+  // 3. probs @ V（从 HBM 读 scores 和 V）
   __half* out_head = out + q_tok * dim + h * head_dim;
-  float d_global = *g_d;
   for (int d = tid; d < head_dim; d += blockDim.x) {
-    out_head[d] = __float2half(o_smem[d] / d_global);
+    float val = 0.0f;
+    for (int t = 0; t < kv_end; t++)
+      val += scores[t] *
+             __half2float(v_cache[t * kv_dim + kv_head * head_dim + d]);
+    out_head[d] = __float2half(val);
   }
 }
 
@@ -997,6 +953,11 @@ void GPUDecoder::forward_prefill(const int* tokens, int n_tokens,
                                                 d_tokens, n_tokens, dim);
   CHECK_KERNEL();
 
+  int kv_end = start_pos + n_tokens;
+  float* d_att_pre;
+  size_t att_size = (size_t)n_tokens * config.n_heads * kv_end * sizeof(float);
+  CHECK_CUDA(cudaMalloc(&d_att_pre, att_size));
+  fprintf(stderr, "att_pre size = %.2f MB\n", att_size / 1024.0 / 1024.0);
   for (int l = 0; l < config.n_layers; l++) {
     // 2.RMSNorm (batch)
     rmsnorm_kernel_batch<<<n_tokens, threads>>>(gs.xb_pre, gs.x_pre,
@@ -1037,10 +998,10 @@ void GPUDecoder::forward_prefill(const int* tokens, int n_tokens,
     // 7. Flash Attention (prefill)
     size_t smem_size = (FA_BLOCK_SIZE + head_dim + 8 + 8 + 2) * sizeof(float);
     dim3 grid(config.n_heads, n_tokens);
-    flash_attention_prefill_kernel<<<grid, threads, smem_size>>>(
+    standard_attention_prefill_kernel<<<grid, threads, smem_size>>>(
         gs.q_pre, gs.k_cache + (size_t)l * config.seq_len * kv_dim,
-        gs.v_cache + (size_t)l * config.seq_len * kv_dim, gs.xb_pre, start_pos,
-        config.seq_len, dim, kv_dim, head_dim, kv_mul);
+        gs.v_cache + (size_t)l * config.seq_len * kv_dim, gs.xb_pre, d_att_pre,
+        start_pos, config.seq_len, dim, kv_dim, head_dim, kv_mul);
     CHECK_KERNEL();
 
     // 8.输出投影 + 残差 (batch)
@@ -1076,6 +1037,7 @@ void GPUDecoder::forward_prefill(const int* tokens, int n_tokens,
                                                  dim);
     CHECK_KERNEL();
   }
+  cudaFree(d_att_pre);
 
   // 12. 最终 RMSNorm（只取最后一个 token）
   // out: gs.xb

@@ -29,9 +29,6 @@ void Decoder::generate(const std::string& user_input, int max_new_tokens,
   auto t_prefill_end = std::chrono::steady_clock::now();
   double prefill_time =
       std::chrono::duration<double>(t_prefill_end - t_prefill_start).count();
-  fprintf(stderr, "prefill: %d tokens in %.3fs (%.1f tokens/s)\n",
-          (int)prompt_tokens.size(), prefill_time,
-          prompt_tokens.size() / prefill_time);
 
   // 生成阶段开始计时
   int n_generated = 0;
@@ -59,6 +56,10 @@ void Decoder::generate(const std::string& user_input, int max_new_tokens,
 
   auto t_end = std::chrono::steady_clock::now();
   double elapsed = std::chrono::duration<double>(t_end - t_start).count();
-  fprintf(stderr, "\n%.2f tokens/s (%d tokens in %.2fs)\n",
+
+  fprintf(stderr, "\nprefill: %.2f tokens/s (%d tokens in %.2fs)\n",
+          prompt_tokens.size() / prefill_time, (int)prompt_tokens.size(),
+          prefill_time);
+  fprintf(stderr, "generate: %.2f tokens/s (%d tokens in %.2fs)\n",
           n_generated / elapsed, n_generated, elapsed);
 }
