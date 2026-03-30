@@ -17,6 +17,7 @@
 | `gpu_v4/` | GPU v4，Flash Attention decode 阶段 |
 | `gpu_v5/` | GPU v5，batch prefill + standard attention |
 | `gpu_v6/` | GPU v6，batch prefill + flash attention prefill |
+| `gpu_v7/` | GPU v7，多请求并发 batch decode |
 | `tests/` | softmax / attention 算法对比实现 |
 | `doc/` | nsys profile 截图 |
 | `CMakeLists.txt` | 构建配置 |
@@ -98,11 +99,11 @@ snapshot_download(
 运行：
 
 ```bash
-# CPU 版本
-./cpu_decoder qwen2.5-3b-instruct-fp16.gguf
-
-# GPU v6（推荐）
+# 单请求
 ./gpu_decoder_v6 qwen2.5-3b-instruct-fp16.gguf
+
+# 多请求并发（batch_size=4）
+./gpu_decoder_v7 qwen2.5-3b-instruct-fp16.gguf 4
 ```
 
 ## 性能对比（Qwen2.5-3B，RTX 5060 Ti 16GB）
@@ -118,6 +119,7 @@ snapshot_download(
 | GPU v4 | ~45 | Flash Attention decode 阶段（无提升） |
 | GPU v5 | ~46 | batch prefill + standard attention |
 | GPU v6 | ~46 | batch prefill + flash attention prefill |
+| GPU v7 | ~87 | 4请求并发 batch decode，总吞吐约 2x |
 
 ### prefill 阶段对比（prompt=3528 tokens）
 
@@ -126,6 +128,14 @@ snapshot_download(
 | GPU v4 | ~58 | 逐 token 循环 | flash attention decode kernel |
 | GPU v5 | ~1059 | batch prefill | standard attention（scores 写 HBM，759MB） |
 | GPU v6 | ~578 | batch prefill | flash attention（简化版，反而更慢） |
+
+### batch decode 对比（4请求并发，短 prompt）
+
+| 指标 | 单请求（v6） | 4请求并发（v7） |
+| :--- | :--- | :--- |
+| 总吞吐 | ~46 tokens/s | ~87 tokens/s |
+| 每请求速度 | ~46 tokens/s | ~22 tokens/s |
+| GPU 利用率 | 低（decode 是 memory-bound） | 更高 |
 
 ## 优化分析
 
@@ -246,6 +256,48 @@ attention_kernel: 2.0%
 ```
 
 这个实验验证了：**分块不等于 flash attention，IO 感知的正确实现（Q/K/V 双重分块）才是关键。**
+
+---
+
+### GPU v6 → v7（batch decode，多请求并发）
+
+实现 fixed batch decode，支持多请求同时推理：
+
+```
+单请求 decode：
+  每个 step 处理 1 个 token
+  matmul [1, dim] × [dim, dim] → gemv，GPU 利用率低
+
+batch decode（4请求）：
+  每个 step 处理 4 个 token（每个请求各一个）
+  matmul [4, dim] × [dim, dim] → gemm，GPU 利用率更高
+```
+
+核心改动：
+
+**每个请求独立的 KV cache：**
+```
+单请求: k_cache[n_layers, seq_len, kv_dim]
+batch:  k_cache[max_batch, n_layers, seq_len, kv_dim]
+attention 时每个请求只看自己的 KV cache 槽
+```
+
+**每个请求独立的 pos：**
+```
+单请求: rope 和 kvcache 写入用同一个 pos
+batch:  positions[batch_size]，每个请求有自己的当前位置
+```
+
+**性能结果（4请求并发）：**
+```
+单请求:    ~46 tokens/s
+4请求并发: ~87 tokens/s 总吞吐（约 2x）
+每请求:    ~22 tokens/s
+```
+
+总吞吐提升约 2x，因为 batch matmul 让 GPU 利用率更高。每个请求的速度下降是正常的，资源被多个请求共享。
+
+**当前实现是 fixed batch：** 即使某个请求已完成，其槽位仍参与计算（结果被丢弃）。生产环境的 continuous batching（如 vLLM）会动态调度，完成的请求立即让出槽位给新请求，GPU 始终处理有效请求。
 
 ## Attention shared memory 限制
 
