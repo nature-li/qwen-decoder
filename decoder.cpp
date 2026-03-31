@@ -35,32 +35,28 @@ void Decoder::generate_continuous(std::vector<std::string>& user_inputs,
       Request* req = scheduler.running[i];
       if (req == nullptr || req->prefill_done) continue;
 
-      // prefill BOS
-      int bos = tokenizer.bos_token_id;
-      if (!scheduler.ensure_pages(req, 1)) {
-        req->finished = true;
-        continue;
-      }
-      forward_prefill(&bos, 1, req->pos, i, req->block_table.table);
-      req->pos++;
+      // 把 BOS 插入 prompt_tokens 最前面
+      std::vector<int> tokens;
+      tokens.push_back(tokenizer.bos_token_id);
+      tokens.insert(tokens.end(), req->prompt_tokens.begin(),
+                    req->prompt_tokens.end());
 
-      // prefill prompt
-      if (req->pos + (int)req->prompt_tokens.size() >= config.seq_len) {
+      if (req->pos + (int)tokens.size() >= config.seq_len) {
         fprintf(stderr, "request %d: prompt too long\n", req->id);
         req->finished = true;
         continue;
       }
 
-      if (!scheduler.ensure_pages(req, (int)req->prompt_tokens.size())) {
+      if (!scheduler.ensure_pages(req, (int)tokens.size())) {
         req->finished = true;
         continue;
       }
-      forward_prefill(req->prompt_tokens.data(), (int)req->prompt_tokens.size(),
-                      req->pos, i, req->block_table.table);
-      req->pos += (int)req->prompt_tokens.size();
+
+      forward_prefill(tokens.data(), (int)tokens.size(), req->pos, i,
+                      req->block_table.table);
+      req->pos += (int)tokens.size();
       req->prefill_done = true;
 
-      // prefill 完成后采样第一个 token
       float* logits = get_logits_batch(i);
       req->cur_token =
           sample_topk(logits, config.vocab_size, top_k, temperature, rng);
