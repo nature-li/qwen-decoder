@@ -11,6 +11,7 @@
 | `gguf_loader.h/cpp` | GGUF 文件格式解析 |
 | `decoder.h/cpp` | Decoder 基类，generate 逻辑 |
 | `scheduler.h/cpp` | 请求调度器，continuous batching 核心 |
+| `paged_kv_cache.h/cpp` | PagedAttention，KV cache 动态分页管理 |
 | `cpu_decoder.h/cpp` | CPU 版本实现 |
 | `gpu_v1/` | GPU 朴素版本，手写 fp16 matmul kernel |
 | `gpu_v2/` | GPU v2，cublasHgemm 替换手写 kernel |
@@ -20,6 +21,7 @@
 | `gpu_v6/` | GPU v6，batch prefill + flash attention prefill |
 | `gpu_v7/` | GPU v7，fixed batch decode，多请求并发 |
 | `gpu_v8/` | GPU v8，continuous batching，动态请求调度 |
+| `gpu_v9/` | GPU v9，PagedAttention，KV cache 动态分页分配 |
 | `tests/` | softmax / attention 算法对比实现 |
 | `doc/` | nsys profile 截图 |
 | `CMakeLists.txt` | 构建配置 |
@@ -109,6 +111,9 @@ snapshot_download(
 
 # continuous batching（max_batch=4，请求数量可超过 max_batch）
 ./gpu_decoder_v8 qwen2.5-3b-instruct-fp16.gguf 4
+
+# PagedAttention + continuous batching（max_batch=8）
+./gpu_decoder_v9 qwen2.5-3b-instruct-fp16.gguf 8
 ```
 
 ## 性能对比（Qwen2.5-3B，RTX 5060 Ti 16GB）
@@ -126,6 +131,7 @@ snapshot_download(
 | GPU v6 | ~46 | batch prefill + flash attention prefill |
 | GPU v7 | ~87 | fixed batch decode，4请求并发，总吞吐约 2x |
 | GPU v8 | ~87 | continuous batching，GPU 利用率从 27% 提升到 87% |
+| GPU v9 | ~117 | PagedAttention，8请求并发，GPU 利用率 90.7% |
 
 ### prefill 阶段对比（prompt=3528 tokens）
 
@@ -135,13 +141,14 @@ snapshot_download(
 | GPU v5 | ~1059 | batch prefill | standard attention（scores 写 HBM，759MB） |
 | GPU v6 | ~578 | batch prefill | flash attention（简化版，反而更慢） |
 
-### batch decode 对比（4请求并发，短 prompt）
+### batch decode 对比
 
-| 指标 | 单请求（v6） | fixed batch（v7） | continuous batching（v8） |
-| :--- | :--- | :--- | :--- |
-| 总吞吐 | ~46 tokens/s | ~87 tokens/s | ~87 tokens/s |
-| GPU Kernels 占比 | ~49% | ~27% | ~87% |
-| GPU Memory 占比 | ~51% | ~73% | ~13% |
+| 指标 | 单请求（v6） | fixed batch（v7） | continuous（v8） | PagedAttention（v9） |
+| :--- | :--- | :--- | :--- | :--- |
+| 并发数 | 1 | 4 | 4 | 8 |
+| 总吞吐 | ~46 tokens/s | ~87 tokens/s | ~87 tokens/s | ~117 tokens/s |
+| GPU Kernels | ~49% | ~27% | ~87% | ~90.7% |
+| GPU Memory | ~51% | ~73% | ~13% | ~9.3% |
 
 ## 优化分析
 
@@ -306,17 +313,68 @@ Kernels: 86.8%，Memory: 13.2%
 attention_batch_kernel: 8.6%
 ```
 
-**v7 vs v8 对比：**
+与 vLLM 的 continuous batching 的区别：v8 的 KV cache 仍然是静态预分配的，每个请求固定占用 `seq_len` 的空间，存在显存碎片问题，v9 用 PagedAttention 解决了这个问题。
+
+---
+
+### GPU v8 → v9（PagedAttention，GPU 利用率 90.7%）
+
+实现 PagedAttention，KV cache 从静态预分配改为动态分页分配：
 
 ```
-              v7（fixed batch）   v8（continuous batching）
-Kernels:      27.0%              86.8%  ← GPU 利用率提升 3x
-Memory:       73.0%              13.2%  ← HBM 读写压力大幅下降
+v8 静态 KV cache：
+  k_cache[max_batch, n_layers, seq_len, kv_dim]
+  每个请求固定占用 seq_len 空间
+  req 只用了 100 token，但占了 32768 的空间，浪费严重
+
+v9 PagedAttention：
+  k_cache[total_pages, block_size, n_layers, kv_dim]
+  每个 page 存 block_size=16 个 token 的 KV
+  请求用多少申请多少，释放后立即归还 PagePool
 ```
 
-v8 的 GPU 始终在做有效计算，内存等待极少，是目前实现中 GPU 利用率最高的版本。
+核心数据结构：
 
-与 vLLM 的 continuous batching 的区别：我们的实现是简化版，KV cache 仍然是静态预分配的。vLLM 用 PagedAttention 实现动态 KV cache 分配，彻底解决显存碎片问题，支持更大的并发数。
+```
+PagePool：管理所有物理块，空闲块队列，allocate()/free()
+BlockTable：每个请求的逻辑块→物理块映射
+  table[0]=9, table[1]=3, table[2]=7  ← 物理块不必连续
+
+attention kernel 通过 BlockTable 查找：
+  token t → 逻辑块 t/block_size → 物理块 id → 实际地址
+```
+
+显存利用率对比：
+
+```
+v8: 4并发，每个请求预占 seq_len=32768 的 KV cache
+    实际使用 100 token，浪费 32668/32768 = 99.7%
+
+v9: 8并发，每个请求只占用实际使用的 page
+    16GB 显存，权重 ~6GB，剩余 ~10GB 全部给 PagePool
+    total_pages=9538，按需分配
+```
+
+**v9 nsys profile：**
+
+![nsys v9](doc/nsys-v9.png)
+
+```
+Kernels: 90.7%，Memory: 9.3%
+attention_paged_kernel: 14.2%  ← 通过 BlockTable 查找，比连续访问略慢
+cuBLAS: 76.2%
+```
+
+**v8 vs v9 对比：**
+
+```
+              v8（static KV cache）   v9（PagedAttention）
+并发数:        4                      8
+总吞吐:        ~87 tokens/s           ~117 tokens/s
+Kernels:      86.8%                  90.7%
+Memory:       13.2%                   9.3%
+显存利用率:    低（预分配浪费严重）     高（按需分配）
+```
 
 ## Attention shared memory 限制
 
