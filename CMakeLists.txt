@@ -39,5 +39,7 @@ endmacro()
 #     gpu_v7/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
 # add_cuda_target(gpu_decoder_v8
 #     gpu_v8/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp scheduler.cpp)
-add_cuda_target(gpu_decoder_v9
-    gpu_v9/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp scheduler.cpp paged_kv_cache.cpp)
+# add_cuda_target(gpu_decoder_v9
+#     gpu_v9/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp scheduler.cpp paged_kv_cache.cpp)
+add_cuda_target(gpu_decoder_v10
+     gpu_v10/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp scheduler.cpp kv_cache.cpp)
