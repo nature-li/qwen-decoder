@@ -11,7 +11,7 @@
 | `gguf_loader.h/cpp` | GGUF 文件格式解析 |
 | `decoder.h/cpp` | Decoder 基类，generate 逻辑 |
 | `scheduler.h/cpp` | 请求调度器，continuous batching 核心 |
-| `paged_kv_cache.h/cpp` | PagedAttention，KV cache 动态分页管理 |
+| `kv_cache.h/cpp` | BlockPool + BlockTable，PagedAttention KV cache 管理 |
 | `cpu_decoder.h/cpp` | CPU 版本实现 |
 | `gpu_v1/` | GPU 朴素版本，手写 fp16 matmul kernel |
 | `gpu_v2/` | GPU v2，cublasHgemm 替换手写 kernel |
@@ -22,6 +22,7 @@
 | `gpu_v7/` | GPU v7，fixed batch decode，多请求并发 |
 | `gpu_v8/` | GPU v8，continuous batching，动态请求调度 |
 | `gpu_v9/` | GPU v9，PagedAttention，KV cache 动态分页分配 |
+| `gpu_v10/` | GPU v10，1-flat 推理，chunked prefill，decode attention 并行 |
 | `tests/` | softmax / attention 算法对比实现 |
 | `doc/` | nsys profile 截图 |
 | `CMakeLists.txt` | 构建配置 |
@@ -45,7 +46,7 @@
 - QKV 投影（cublasHgemm fp16）
 - Q/K/V bias
 - RoPE 位置编码（动态计算，rope_freq_base=1000000）
-- KV Cache（fp16）
+- KV Cache（fp16，PagedAttention 动态分页）
 - Multi-Head Attention（GQA，n_heads=16，n_kv_heads=2）
 - SwiGLU FFN
 - Temperature + Top-K 采样
@@ -114,24 +115,28 @@ snapshot_download(
 
 # PagedAttention + continuous batching（max_batch=8）
 ./gpu_decoder_v9 qwen2.5-3b-instruct-fp16.gguf 8
+
+# 1-flat 推理（max_batch=64，max_prefill_len=4096，max_prefill_tokens_per_step=512）
+./gpu_decoder_v10 qwen2.5-3b-instruct-fp16.gguf 64 4096 512
 ```
 
-## 性能对比（Qwen2.5-3B，RTX 5060 Ti 16GB）
+## 性能对比（Qwen2.5-3B fp16，RTX 5060 Ti 16GB，temperature=0）
 
-### decode 阶段（短 prompt，~20 tokens）
+### 完整优化路径
 
-| 版本 | tokens/s | 说明 |
-| :--- | :--- | :--- |
-| CPU C++ | ~2 | fp16 逐元素转换，朴素 matmul |
-| GPU v1 | ~6 | 手写 fp16 matmul kernel |
-| GPU v2 | ~34 | cublasHgemm，中间状态仍是 fp32 |
-| GPU v3 | ~45 | 全程 fp16，消除类型转换开销 |
-| GPU v4 | ~45 | Flash Attention decode 阶段（无提升） |
-| GPU v5 | ~46 | batch prefill + standard attention |
-| GPU v6 | ~46 | batch prefill + flash attention prefill |
-| GPU v7 | ~87 | fixed batch decode，4请求并发，总吞吐约 2x |
-| GPU v8 | ~87 | continuous batching，GPU 利用率从 27% 提升到 87% |
-| GPU v9 | ~117 | PagedAttention，8请求并发，GPU 利用率 90.7% |
+| 版本 | tokens/s | 较 v1 提升 | 说明 |
+| :--- | :--- | :--- | :--- |
+| CPU C++ | 0.11 | - | fp16 逐元素转换，朴素 matmul |
+| GPU v1 | 7.18 | 1x | 手写 fp16 matmul kernel |
+| GPU v2 | 47.48 | 6.6x | cublasHgemm，中间状态仍是 fp32 |
+| GPU v3 | 48.29 | 6.7x | 全程 fp16，消除类型转换开销 |
+| GPU v4 | 48.99 | 6.8x | Flash Attention decode 阶段（无提升） |
+| GPU v5 | 53.12 | 7.4x | batch prefill，prefill 速度提升 18x |
+| GPU v6 | 52.60 | 7.3x | batch prefill + flash attention（反而更慢） |
+| GPU v7 | 209.34 | 29x | fixed batch decode, 4并发 |
+| GPU v8 | 168.0 | 23x | continuous batching, 4并发 |
+| GPU v9 | 869.9 | 121x | PagedAttention，64并发 |
+| GPU v10 | 1341.0 | 187x | 1-flat 推理，64并发 |
 
 ### prefill 阶段对比（prompt=3528 tokens）
 
@@ -141,18 +146,19 @@ snapshot_download(
 | GPU v5 | ~1059 | batch prefill | standard attention（scores 写 HBM，759MB） |
 | GPU v6 | ~578 | batch prefill | flash attention（简化版，反而更慢） |
 
-### batch decode 对比
+### GPU 利用率对比
 
-| 指标 | 单请求（v6） | fixed batch（v7） | continuous（v8） | PagedAttention（v9） |
+| 版本 | 并发数 | GPU Kernels | GPU Memory | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
-| 并发数 | 1 | 4 | 4 | 8 |
-| 总吞吐 | ~46 tokens/s | ~87 tokens/s | ~87 tokens/s | ~117 tokens/s |
-| GPU Kernels | ~49% | ~27% | ~87% | ~90.7% |
-| GPU Memory | ~51% | ~73% | ~13% | ~9.3% |
+| v6 | 1 | ~49% | ~51% | 单请求，decode memory-bound |
+| v7 | 4 | ~27% | ~73% | fixed batch，请求完成后槽位浪费 |
+| v8 | 4 | ~87% | ~13% | continuous batching，GPU 始终满载 |
+| v9 | 64 | ~90.7% | ~9.3% | PagedAttention，并发数翻倍 |
+| v10 | 64 | ~68.5% | ~31.5% | 1-flat，prefill 阶段 memcpy 较多 |
 
 ## 优化分析
 
-### GPU v1 → v2（5x 提升）
+### GPU v1 → v2（6.6x 提升）
 
 用 `cublasHgemm` 替换手写 `matmul_fp16_kernel`。v1 手写 kernel 的 grid 只有几个 block，SM 大量闲置。cuBLAS 底层使用 cutlass，自动选择最优调度，SM 利用率大幅提升。
 
@@ -272,7 +278,7 @@ attention_kernel: 2.0%
 
 ---
 
-### GPU v6 → v7（fixed batch decode，总吞吐 2x）
+### GPU v6 → v7（fixed batch decode，总吞吐 4x）
 
 实现 fixed batch decode，支持多请求同时推理。每个请求有独立的 KV cache 和 pos，attention 时只看自己的 KV cache 槽。
 
@@ -284,7 +290,7 @@ attention_kernel: 2.0%
 Kernels: 27.0%，Memory: 73.0%
 ```
 
-**Memory 高达 73% 的原因：** fixed batch 里请求长度不齐，短的请求完成后槽位空着，实际 batch size 退化为 1-2，matmul 退化成 gemv，变成 memory-bound。
+**Memory 高达 73% 的原因：** fixed batch 里请求长度不齐，短的请求完成后槽位空着，实际 batch size 退化，matmul 退化成 gemv，变成 memory-bound。
 
 ---
 
@@ -324,35 +330,23 @@ attention_batch_kernel: 8.6%
 ```
 v8 静态 KV cache：
   k_cache[max_batch, n_layers, seq_len, kv_dim]
-  每个请求固定占用 seq_len 空间
-  req 只用了 100 token，但占了 32768 的空间，浪费严重
+  每个请求固定占用 seq_len=32768 的空间，浪费严重
 
 v9 PagedAttention：
-  k_cache[total_pages, block_size, n_layers, kv_dim]
-  每个 page 存 block_size=16 个 token 的 KV
-  请求用多少申请多少，释放后立即归还 PagePool
+  k_cache[total_blocks, block_size, n_layers, kv_dim]
+  每个 block 存 block_size=16 个 token 的 KV
+  请求用多少申请多少，释放后立即归还 BlockPool
 ```
 
 核心数据结构：
 
 ```
-PagePool：管理所有物理块，空闲块队列，allocate()/free()
+BlockPool：管理所有物理块，空闲块队列，allocate()/free()
 BlockTable：每个请求的逻辑块→物理块映射
   table[0]=9, table[1]=3, table[2]=7  ← 物理块不必连续
 
 attention kernel 通过 BlockTable 查找：
   token t → 逻辑块 t/block_size → 物理块 id → 实际地址
-```
-
-显存利用率对比：
-
-```
-v8: 4并发，每个请求预占 seq_len=32768 的 KV cache
-    实际使用 100 token，浪费 32668/32768 = 99.7%
-
-v9: 8并发，每个请求只占用实际使用的 page
-    16GB 显存，权重 ~6GB，剩余 ~10GB 全部给 PagePool
-    total_pages=9538，按需分配
 ```
 
 **v9 nsys profile：**
@@ -361,19 +355,89 @@ v9: 8并发，每个请求只占用实际使用的 page
 
 ```
 Kernels: 90.7%，Memory: 9.3%
-attention_paged_kernel: 14.2%  ← 通过 BlockTable 查找，比连续访问略慢
+attention_paged_kernel: 14.2%
 cuBLAS: 76.2%
 ```
 
-**v8 vs v9 对比：**
+---
+
+### GPU v9 → v10（1-flat 推理，64并发，1341 tokens/s）
+
+v10 是目前最终版本，核心改动有四处：
+
+**1. 1-flat 推理**
+
+把所有请求的 token 打包成一个 flat batch，一次 forward 处理：
 
 ```
-              v8（static KV cache）   v9（PagedAttention）
-并发数:        4                      8
-总吞吐:        ~87 tokens/s           ~117 tokens/s
-Kernels:      86.8%                  90.7%
-Memory:       13.2%                   9.3%
-显存利用率:    低（预分配浪费严重）     高（按需分配）
+v9：
+  prefill：串行，一个请求 prefill 完再 prefill 下一个
+  decode：batch，多个请求并发
+  两个阶段分开处理，每步有多次 kernel launch
+
+v10：
+  flat batch = [req0_prefill_tokens..., req1_decode_token, req2_decode_token, ...]
+  matmul/FFN 一次处理所有 token
+  prefill attention 按请求串行（causal mask 不同，无法合并）
+  decode attention 所有 token 一次并行 launch
+```
+
+**2. chunked prefill**
+
+每步 prefill token 总数不超过 `max_prefill_tokens_per_step`，多个请求共享预算：
+
+```
+没有 chunked prefill：
+  新请求进来，prompt=2000 tokens，一次性全部 prefill
+  total_tokens 突然变大，GPU 负载波动
+
+有 chunked prefill（max_prefill_tokens_per_step=512）：
+  每步最多 512 个 prefill token
+  total_tokens ≈ max_prefill_tokens_per_step + n_decode，始终稳定
+  同时降低 TTFT（首 token 延迟），prefill 和 decode 交替进行
+```
+
+**3. decode attention 并行**
+
+```
+v9（1-flat 之前的实现）：
+  for each decode request:
+      attention_paged_kernel(...)  ← 串行，每个请求单独 launch
+
+v10：
+  gather_q_kernel：从 q_flat 抽取所有 decode token 的 q → q_dec
+  decode_attention_kernel：一次 launch 处理所有 decode token（并行）
+  scatter_xb_kernel：decode attention 结果写回 xb_flat
+```
+
+**4. update_block_table 增量更新**
+
+```
+v9：每步上传所有 max_batch 个槽位的 block_table，上传量大
+v10：只上传有变化的槽位，且每个槽位只传实际用到的 block 数
+     从 max_batch * max_blocks_per_seq * 4 bytes 降到几十 bytes
+```
+
+**v10 nsys profile：**
+
+![nsys v10](doc/nsys-v10.png)
+
+```
+Kernels: 68.5%，Memory: 31.5%
+cuBLAS: 74.4%
+decode_attention_kernel: 16.3%
+```
+
+Memory 占比较高的原因是 prefill 阶段需要频繁上传 flat_tokens、flat_positions、slot_mapping 等元数据，decode 阶段稳定后 Kernels 占比明显提升。
+
+**v9 vs v10 对比：**
+
+```
+              v9（PagedAttention）   v10（1-flat + chunked prefill）
+并发数:        8                     64
+总吞吐:        ~870 tokens/s         ~1341 tokens/s
+Kernels:      90.7%                 68.5%
+Memory:        9.3%                 31.5%
 ```
 
 ## Attention shared memory 限制
