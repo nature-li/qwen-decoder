@@ -1099,7 +1099,7 @@ int main(int argc, char** argv) {
                                  max_prefill_tokens_per_step, max_total_tokens);
 
   std::mt19937 rng(42);
-  float temperature = 0.7f;
+  float temperature = 0.0f;
   int top_k = 30;
   int max_new_toks = 256;
 
