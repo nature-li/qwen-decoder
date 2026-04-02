@@ -657,12 +657,12 @@ static void matmul(cublasHandle_t h, __half* out, const __half* x, const __half*
 // ============================================================================
 // GPUDecoder 实现
 // ============================================================================
-GPUDecoder::GPUDecoder(const std::string& model_file, int max_concurrent_seqs, int max_prefill_len,
+GPUDecoder::GPUDecoder(const std::string& model_file, int max_batch, int max_prefill_len,
                        int max_prefill_tokens_per_step, int max_total_tokens)
-    : max_batch_(max_concurrent_seqs),
+    : max_batch_(max_batch),
       max_prefill_len_(max_prefill_len),
-      max_prefill_tokens_per_step_(max_prefill_tokens_per_step),
-      max_flat_tokens_(max_total_tokens) {
+      max_prefill_tokens_per_step_(max_prefill_tokens_per_step) {
+  max_flat_tokens_ = std::max(max_total_tokens, max_prefill_tokens_per_step + max_batch);
   if (load_gguf(gguf, model_file) != 0) {
     fprintf(stderr, "load gguf failed\n");
     exit(1);
@@ -1077,7 +1077,7 @@ int main(int argc, char** argv) {
   }
 
   // 最大并发请求数
-  int max_concurrent_seqs = 64;
+  int max_batch = 64;
   // 单个请求 prompt 的最大长度
   int max_prefill_len = 4096;
   // 每步允许处理的最大 prefill token 数(所有请求共享的预算)
@@ -1085,18 +1085,18 @@ int main(int argc, char** argv) {
   // 每步最多处理多少 token
   int max_total_tokens = 1024;
 
-  if (argc >= 3) max_concurrent_seqs = atoi(argv[2]);
+  if (argc >= 3) max_batch = atoi(argv[2]);
   if (argc >= 4) max_prefill_len = atoi(argv[3]);
   if (argc >= 5) max_prefill_tokens_per_step = atoi(argv[4]);
   if (argc >= 6) max_total_tokens = atoi(argv[5]);
 
   fprintf(stderr,
-          "max_concurrent_seqs=%d max_total_tokens=%d "
+          "max_batch=%d max_total_tokens=%d "
           "max_prefill_len=%d max_prefill_step=%d\n",
-          max_concurrent_seqs, max_total_tokens, max_prefill_len, max_prefill_tokens_per_step);
+          max_batch, max_total_tokens, max_prefill_len, max_prefill_tokens_per_step);
 
-  auto* decoder = new GPUDecoder(argv[1], max_concurrent_seqs, max_prefill_len,
-                                 max_prefill_tokens_per_step, max_total_tokens);
+  auto* decoder = new GPUDecoder(argv[1], max_batch, max_prefill_len, max_prefill_tokens_per_step,
+                                 max_total_tokens);
 
   std::mt19937 rng(42);
   float temperature = 0.0f;
@@ -1119,7 +1119,7 @@ int main(int argc, char** argv) {
   }
   fprintf(stderr, "%d requests\n", (int)inputs.size());
 
-  decoder->generate_continuous(inputs, max_concurrent_seqs, max_new_toks, temperature, top_k, rng);
+  decoder->generate_continuous(inputs, max_batch, max_new_toks, temperature, top_k, rng);
 
   delete decoder;
   return 0;
