@@ -50,9 +50,10 @@ struct PrefillRequest {
 // P → D：prefill 完成
 struct PrefillResponse {
   int32_t req_id;
-  int32_t n_tokens;  // prefill 了多少个 token
-  int32_t n_layers;  // KV cache 层数
-  int32_t kv_dim;    // KV cache 维度
+  int32_t n_tokens;     // prefill 了多少个 token
+  int32_t n_layers;     // KV cache 层数
+  int32_t kv_dim;       // KV cache 维度
+  int32_t first_token;  // P节点采样的第一个 token
   // 后续 NCCL 传输 KV cache
 };
 

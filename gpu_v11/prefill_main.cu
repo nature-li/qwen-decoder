@@ -169,6 +169,11 @@ int main(int argc, char** argv) {
 
       fprintf(stderr, "prefill 完成 req_id=%d\n", req_id);
 
+      // forward 完成后采样
+      float* logits = decoder->get_logits_batch(0);
+      std::mt19937 rng(42);
+      int first_token = sample_topk(logits, cfg.vocab_size, 30, 0.0f, rng);
+
       // 6. 收集 slots
       std::vector<int> slots(n_tokens);
       for (int j = 0; j < n_tokens; j++) {
@@ -183,6 +188,7 @@ int main(int argc, char** argv) {
       resp.n_tokens = n_tokens;
       resp.n_layers = n_layers;
       resp.kv_dim = kv_dim;
+      resp.first_token = first_token;
       tcp_send_msg(tcp_fd, MsgType::PREFILL_RESPONSE, &resp, sizeof(resp));
 
       // 8. 通过 NCCL 传输 KV cache

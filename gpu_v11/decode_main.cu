@@ -148,6 +148,7 @@ int main(int argc, char** argv) {
     r->pos = n_tokens;  // decode 从 n_tokens 开始
     r->prefill_done = true;
     r->finished = false;
+    r->cur_token = resp.first_token;
 
     int need_blocks = (n_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE;
     for (int i = 0; i < need_blocks; i++) {
@@ -184,55 +185,7 @@ int main(int argc, char** argv) {
       fprintf(stderr, "KV cache 接收完成：%.1fMB in %.1fms (%.1f MB/s)\n", mb, ms, mb / ms * 1000);
     }
 
-    // ----------------------------------------------------------------
-    // 6. 采样第一个 decode token（用 prefill 的最后一个 logits）
-    // ----------------------------------------------------------------
-    // 注意：P节点 forward_flat 完成后 logits 在 P节点的 GPU 上
-    // D节点需要重新跑一次 forward 来得到 logits
-    // 最简单的方案：D节点用收到的 KV cache 跑一次 decode forward
-    {
-      // 先为 decode token 分配一个 block（如果需要）
-      int decode_pos = r->pos;
-      int need_blocks_dec = (decode_pos + BLOCK_SIZE - 1) / BLOCK_SIZE;
-      while (r->block_table.num_blocks() < need_blocks_dec) {
-        int block_id = pool->allocate();
-        if (block_id < 0) {
-          fprintf(stderr, "OOM during decode init\n");
-          goto cleanup;
-        }
-        r->block_table.add_block(block_id);
-      }
-
-      // 用 prompt 最后一个 token 跑一次 decode，得到第一个 next_token
-      // 注意：pos = n_tokens - 1，attention 会看到所有 KV cache
-      FlatRequest fr;
-      fr.req_idx = 0;
-      fr.flat_offset = 0;
-      fr.n_tokens = 1;
-      fr.start_pos = n_tokens - 1;
-      fr.is_prefill = false;
-
-      std::vector<FlatRequest> flat_reqs = {fr};
-      std::vector<int> flat_tokens = {prompt_tokens.back()};
-      std::vector<int> flat_positions = {n_tokens - 1};
-      std::vector<int> token_to_seq = {0};
-      std::vector<int> slot_mapping = {r->block_table.physical_idx(n_tokens - 1) * BLOCK_SIZE +
-                                       r->block_table.block_offset(n_tokens - 1)};
-      std::vector<int> last_tok_idx = {0};
-      std::vector<int> dec_flat = {0};
-      std::vector<int> dec_pos = {n_tokens - 1};
-      std::vector<int> dec_seq = {0};
-
-      std::vector<Request*> running_tmp(1, r);
-      std::vector<int> changed = {0};
-      decoder->update_block_table_partial(running_tmp, changed, max_blk);
-
-      decoder->forward_flat(flat_reqs, flat_tokens, flat_positions, token_to_seq, slot_mapping,
-                            last_tok_idx, dec_flat, dec_pos, dec_seq, 1);
-
-      float* logits = decoder->get_logits_batch(0);
-      r->cur_token = sample_topk(logits, cfg.vocab_size, top_k, temperature, rng);
-    }
+    // 6.省略，不再重新采样
 
     // ----------------------------------------------------------------
     // 7. decode 循环
