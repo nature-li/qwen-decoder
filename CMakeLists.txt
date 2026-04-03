@@ -15,31 +15,28 @@ find_package(CUDAToolkit REQUIRED)
 
 macro(add_cuda_target target)
   add_executable(${target} ${ARGN})
-  target_link_libraries(${target} PRIVATE CUDA::cudart cublas)
+  target_link_libraries(${target} PRIVATE CUDA::cudart cublas nccl)
   target_include_directories(${target} PRIVATE ${CMAKE_SOURCE_DIR})
   set_target_properties(${target} PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 endmacro()
 
-# add_executable(cpu_decoder cpu_main.cpp gguf_loader.cpp common.cpp decoder.cpp cpu_decoder.cpp)
-
-# add_cuda_target(gpu_decoder_v1
-#     gpu_v1/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
-# add_cuda_target(gpu_decoder_v2
-#     gpu_v2/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
-# add_cuda_target(gpu_decoder_v3
-#     gpu_v3/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
-# add_cuda_target(gpu_decoder_v4
-#     gpu_v4/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
-# add_cuda_target(gpu_decoder_v5
-#     gpu_v5/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
-# add_cuda_target(gpu_decoder_v6
-#     gpu_v6/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
-# add_cuda_target(gpu_decoder_v7
-#     gpu_v7/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp)
-# add_cuda_target(gpu_decoder_v8
-#     gpu_v8/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp scheduler.cpp)
-# add_cuda_target(gpu_decoder_v9
-#     gpu_v9/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp scheduler.cpp paged_kv_cache.cpp)
 add_cuda_target(gpu_decoder_v10
      gpu_v10/gpu_decoder.cu decoder.cpp common.cpp gguf_loader.cpp scheduler.cpp kv_cache.cpp)
+
+add_cuda_target(gpu_decoder_v11
+     gpu_v11/gpu_decoder.cu gpu_v11/main.cu decoder.cpp common.cpp gguf_loader.cpp scheduler.cpp kv_cache.cpp)
+
+# P节点：只做 prefill
+add_cuda_target(prefill_node
+    gpu_v11/prefill_main.cu
+    gpu_v11/gpu_decoder.cu
+    gpu_v11/pd_comm.cpp
+    decoder.cpp common.cpp gguf_loader.cpp scheduler.cpp kv_cache.cpp)
+
+# D节点：只做 decode
+add_cuda_target(decode_node
+    gpu_v11/decode_main.cu
+    gpu_v11/gpu_decoder.cu
+    gpu_v11/pd_comm.cpp
+    decoder.cpp common.cpp gguf_loader.cpp scheduler.cpp kv_cache.cpp)

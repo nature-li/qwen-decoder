@@ -150,6 +150,10 @@ struct BlockTable {
     table_.clear();
   }
 
+  size_t size() {
+    return table_.size();
+  }
+
  private:
   /**
    * table[i]: 第 i 个逻辑块对应的物理块 id

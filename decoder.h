@@ -149,6 +149,18 @@ class Decoder {
                            int top_k,           // top-k 采样
                            std::mt19937& rng);  // 随机数生成器
 
+  const Config& get_config() const { return config; }
+
+  std::string apply_chat_template_pub(const std::string& input) {
+    return apply_chat_template(input);
+  }
+
+  void encode_pub(const std::string& prompt, std::vector<int>& tokens) {
+    encode(tokenizer, prompt, tokens);
+  }
+
+  Tokenizer& get_tokenizer() { return tokenizer; }
+
  protected:
   // 模型配置
   Config config;
