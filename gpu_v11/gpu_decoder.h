@@ -87,6 +87,7 @@ class GPUDecoder : public Decoder {
 
   float* get_logits_batch(int batch_idx) override;
   BlockPool* get_block_pool() override { return block_pool; }
+  int get_max_batch() const {return max_batch_;}
   int get_max_blocks_per_seq() const override { return max_blocks_per_seq_; }
   int get_max_prefill_tokens_per_step() const override { return max_prefill_tokens_per_step_; }
 
@@ -140,6 +141,7 @@ class GPUDecoder : public Decoder {
   Weights w;
   GPUWeights gw;
   GPURunState gs;
-  cublasHandle_t cublas_handle;
   BlockPool* block_pool;
+  cublasHandle_t cublas_handle;
+  cudaStream_t stream;
 };

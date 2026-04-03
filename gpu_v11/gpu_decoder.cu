@@ -689,7 +689,6 @@ GPUDecoder::GPUDecoder(const std::string& model_file, int max_batch, int max_pre
   max_blocks_per_seq_ = (config.seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
   alloc_run_state(gs, config, max_batch_, max_blocks_per_seq_, max_flat_tokens_);
-  CHECK_CUBLAS(cublasCreate(&cublas_handle));
 
   // 权重和运行时缓冲区分配完后，查询剩余显存给 BlockPool
   size_t free_mem, total_mem;
@@ -706,10 +705,15 @@ GPUDecoder::GPUDecoder(const std::string& model_file, int max_batch, int max_pre
           (float)budget / 1024 / 1024 / 1024, total_pgs);
 
   block_pool = new BlockPool(total_pgs, BLOCK_SIZE, config.n_layers, kv_dim);
+
+  CHECK_CUBLAS(cublasCreate(&cublas_handle));
+  CHECK_CUDA(cudaStreamCreate(&stream));
+  CHECK_CUBLAS(cublasSetStream(cublas_handle, stream));
 }
 
 GPUDecoder::~GPUDecoder() {
   cublasDestroy(cublas_handle);
+  cudaStreamDestroy(stream);
   free_run_state(gs);
   free_gpu_weights(gw, config);
   free_weights(w);
@@ -718,7 +722,7 @@ GPUDecoder::~GPUDecoder() {
 }
 
 float* GPUDecoder::get_logits_batch(int batch_idx) {
-  cudaDeviceSynchronize();
+  cudaStreamSynchronize(stream);
   return gs.logits + (size_t)batch_idx * config.vocab_size;
 }
 
@@ -792,7 +796,8 @@ void GPUDecoder::forward_flat(
    * OUT:
    * - gs.x
    */
-  embedding_kernel<<<total_tokens, T>>>(gs.x, gw.token_embedding, gs.d_tokens, total_tokens, dim);
+  embedding_kernel<<<total_tokens, T, 0, stream>>>(gs.x, gw.token_embedding, gs.d_tokens,
+                                                   total_tokens, dim);
   CHECK_KERNEL();
 
   size_t smem = (FA_BLOCK + head_dim + 8 + 8 + 2) * sizeof(float);
@@ -807,7 +812,7 @@ void GPUDecoder::forward_flat(
      * OUT:
      * - gs.xb
      */
-    rmsnorm_kernel<<<total_tokens, T>>>(gs.xb, gs.x, gw.rms_att[l], dim);
+    rmsnorm_kernel<<<total_tokens, T, 0, stream>>>(gs.xb, gs.x, gw.rms_att[l], dim);
     CHECK_KERNEL();
 
     /**
@@ -833,9 +838,9 @@ void GPUDecoder::forward_flat(
      * OUT:
      * - gs.q, gs.k, gs.v
      */
-    add_bias_kernel<<<total_tokens, T>>>(gs.q, gw.bq[l], total_tokens, dim);
-    add_bias_kernel<<<total_tokens, T>>>(gs.k, gw.bk[l], total_tokens, kv_dim);
-    add_bias_kernel<<<total_tokens, T>>>(gs.v, gw.bv[l], total_tokens, kv_dim);
+    add_bias_kernel<<<total_tokens, T, 0, stream>>>(gs.q, gw.bq[l], total_tokens, dim);
+    add_bias_kernel<<<total_tokens, T, 0, stream>>>(gs.k, gw.bk[l], total_tokens, kv_dim);
+    add_bias_kernel<<<total_tokens, T, 0, stream>>>(gs.v, gw.bv[l], total_tokens, kv_dim);
     CHECK_KERNEL();
 
     /**
@@ -847,8 +852,8 @@ void GPUDecoder::forward_flat(
      * OUT:
      * - gs.q, gs.k
      */
-    rope_kernel<<<total_tokens, T>>>(gs.q, gs.k, gs.d_positions, total_tokens, dim, kv_dim,
-                                     head_dim, config.rope_freq_base);
+    rope_kernel<<<total_tokens, T, 0, stream>>>(gs.q, gs.k, gs.d_positions, total_tokens, dim,
+                                                kv_dim, head_dim, config.rope_freq_base);
     CHECK_KERNEL();
 
     /**
@@ -863,9 +868,9 @@ void GPUDecoder::forward_flat(
      * - k_cache
      * - v_cache
      */
-    kvcache_write_kernel<<<total_tokens, T>>>(block_pool->get_k_cache(), block_pool->get_v_cache(),
-                                              gs.k, gs.v, gs.d_slot_map, total_tokens, l,
-                                              config.n_layers, kv_dim);
+    kvcache_write_kernel<<<total_tokens, T, 0, stream>>>(
+        block_pool->get_k_cache(), block_pool->get_v_cache(), gs.k, gs.v, gs.d_slot_map,
+        total_tokens, l, config.n_layers, kv_dim);
     CHECK_KERNEL();
 
     // Attention: prefill (per-request, serial) + decode (all parallel)
@@ -888,7 +893,7 @@ void GPUDecoder::forward_flat(
        * OUT:
        * - o_fr (来自 gs.xb)
        */
-      prefill_attention_kernel<<<grid, T, smem>>>(
+      prefill_attention_kernel<<<grid, T, smem, stream>>>(
           q_fr, block_pool->get_k_cache(), block_pool->get_v_cache(), o_fr, bt, fr.start_pos,
           BLOCK_SIZE, config.n_layers, l, dim, kv_dim, head_dim, kv_mul);
       CHECK_KERNEL();
@@ -904,7 +909,7 @@ void GPUDecoder::forward_flat(
        * OUT:
        * - gs.q_dec
        */
-      gather_q_kernel<<<n_dec, T>>>(gs.q_dec, gs.q, gs.d_dec_flat, n_dec, dim);
+      gather_q_kernel<<<n_dec, T, 0, stream>>>(gs.q_dec, gs.q, gs.d_dec_flat, n_dec, dim);
       CHECK_KERNEL();
 
       dim3 grid_dec(config.n_heads, n_dec);
@@ -916,7 +921,7 @@ void GPUDecoder::forward_flat(
        * OUT:
        * - gs.xb_dec
        */
-      decode_attention_kernel<<<grid_dec, T, smem>>>(
+      decode_attention_kernel<<<grid_dec, T, smem, stream>>>(
           gs.q_dec, block_pool->get_k_cache(), block_pool->get_v_cache(), gs.xb_dec, gs.block_table,
           gs.d_dec_pos, gs.d_dec_seq, l, max_blocks_per_seq_, BLOCK_SIZE, dim, kv_dim, head_dim,
           kv_mul, config.n_layers);
@@ -934,7 +939,7 @@ void GPUDecoder::forward_flat(
        * OUT:
        * - gs.xb
        */
-      scatter_xb_kernel<<<n_dec, T>>>(gs.xb, gs.xb_dec, gs.d_dec_flat, n_dec, dim);
+      scatter_xb_kernel<<<n_dec, T, 0, stream>>>(gs.xb, gs.xb_dec, gs.d_dec_flat, n_dec, dim);
       CHECK_KERNEL();
     }
 
@@ -956,7 +961,7 @@ void GPUDecoder::forward_flat(
      * OUT:
      * - gs.x
      */
-    residual_kernel<<<total_tokens, T>>>(gs.x, gs.xb2, total_tokens, dim);
+    residual_kernel<<<total_tokens, T, 0, stream>>>(gs.x, gs.xb2, total_tokens, dim);
     CHECK_KERNEL();
 
     /**
@@ -968,7 +973,7 @@ void GPUDecoder::forward_flat(
      * OUT:
      * - gs.xb
      */
-    rmsnorm_kernel<<<total_tokens, T>>>(gs.xb, gs.x, gw.rms_ffn[l], dim);
+    rmsnorm_kernel<<<total_tokens, T, 0, stream>>>(gs.xb, gs.x, gw.rms_ffn[l], dim);
     CHECK_KERNEL();
 
     // SwiGLU FFN
@@ -999,7 +1004,7 @@ void GPUDecoder::forward_flat(
      * OUT:
      * - gs.hb
      */
-    swiglu_kernel<<<total_tokens, T>>>(gs.hb, gs.hb2, total_tokens, config.hidden_dim);
+    swiglu_kernel<<<total_tokens, T, 0, stream>>>(gs.hb, gs.hb2, total_tokens, config.hidden_dim);
     CHECK_KERNEL();
 
     /**
@@ -1020,7 +1025,7 @@ void GPUDecoder::forward_flat(
      * OUT:
      * - gs.x
      */
-    residual_kernel<<<total_tokens, T>>>(gs.x, gs.xb2, total_tokens, dim);
+    residual_kernel<<<total_tokens, T, 0, stream>>>(gs.x, gs.xb2, total_tokens, dim);
     CHECK_KERNEL();
   }
 
@@ -1031,7 +1036,7 @@ void GPUDecoder::forward_flat(
    * OUT:
    * - gs.xb
    */
-  rmsnorm_kernel<<<total_tokens, T>>>(gs.xb, gs.x, gw.rms_final, dim);
+  rmsnorm_kernel<<<total_tokens, T, 0, stream>>>(gs.xb, gs.x, gw.rms_final, dim);
   CHECK_KERNEL();
 
   /**
@@ -1049,7 +1054,8 @@ void GPUDecoder::forward_flat(
    * OUT:
    * - gs.logits_last_tok
    */
-  extract_last_token_kernel<<<batch, T>>>(gs.logits_last_tok, gs.xb, gs.d_last_tok_idx, batch, dim);
+  extract_last_token_kernel<<<batch, T, 0, stream>>>(gs.logits_last_tok, gs.xb, gs.d_last_tok_idx,
+                                                     batch, dim);
   CHECK_KERNEL();
 
   /**
@@ -1062,6 +1068,6 @@ void GPUDecoder::forward_flat(
   matmul(cublas_handle, gs.logits_fp16, gs.logits_last_tok, gw.wcls, dim, config.vocab_size, batch);
 
   // 精度转换
-  fp16_to_fp32_kernel<<<batch, T>>>(gs.logits, gs.logits_fp16, batch, config.vocab_size);
+  fp16_to_fp32_kernel<<<batch, T, 0, stream>>>(gs.logits, gs.logits_fp16, batch, config.vocab_size);
   CHECK_KERNEL();
 }
