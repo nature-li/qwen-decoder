@@ -90,8 +90,6 @@ void free_weights(Weights& w);
 
 int load_tokenizer(Tokenizer& t, const GGUFFile& gguf);
 
-const char* decode(Tokenizer& t, int prev_token, int token);
-
 // 在词表里查找字符串，返回 token id，找不到返回 -1
 int vocab_lookup(const Tokenizer& t, const std::string& str);
 
