@@ -46,19 +46,19 @@ macro(add_pd_target target)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 endmacro()
 
-add_cuda_target(gpu_decoder_v14
-    gpu_v14/gpu_decoder.cu
-    gpu_v14/main.cu
+add_cuda_target(gpu_decoder_v15
+    gpu_v15/gpu_decoder.cu
+    gpu_v15/main.cu
     decoder.cpp common.cpp gguf_loader.cpp scheduler.cpp kv_cache.cpp)
 
 add_pd_target(prefill_node
-    gpu_v14/prefill_main.cu
-    gpu_v14/gpu_decoder.cu
-    gpu_v14/pd_comm.cpp
+    gpu_v15/prefill_main.cu
+    gpu_v15/gpu_decoder.cu
+    gpu_v15/pd_comm.cpp
     decoder.cpp common.cpp gguf_loader.cpp scheduler.cpp kv_cache.cpp)
 
 add_pd_target(decode_node
-    gpu_v14/decode_main.cu
-    gpu_v14/gpu_decoder.cu
-    gpu_v14/pd_comm.cpp
+    gpu_v15/decode_main.cu
+    gpu_v15/gpu_decoder.cu
+    gpu_v15/pd_comm.cpp
     decoder.cpp common.cpp gguf_loader.cpp scheduler.cpp kv_cache.cpp)
