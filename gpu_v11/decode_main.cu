@@ -87,7 +87,9 @@ int main(int argc, char** argv) {
   int idx = 0;
   while (true) {
     printf("User[%d] (empty to start): ", idx++);
-    if (!std::getline(std::cin, line) || line.empty()) break;
+    if (!std::getline(std::cin, line) || line.empty()) {
+      break;
+    }
     user_inputs.push_back(line);
   }
 
@@ -124,6 +126,10 @@ int main(int argc, char** argv) {
     req_msg->req_id = req_id;
     req_msg->n_tokens = n_tokens;
     memcpy(body.data() + sizeof(PrefillRequest), prompt_tokens.data(), n_tokens * sizeof(int));
+
+    // 发送 PrefillRequest 之前记录开始时间
+    auto t_ttft_start = std::chrono::steady_clock::now();
+
     tcp_send_msg(tcp_fd, MsgType::PREFILL_REQUEST, body.data(), body_size);
     fprintf(stderr, "已发送 PrefillRequest\n");
 
@@ -131,14 +137,23 @@ int main(int argc, char** argv) {
     // 3. 等待 PrefillResponse
     // ----------------------------------------------------------------
     MsgHeader resp_header;
-    if (!tcp_recv_header(tcp_fd, resp_header)) break;
+    if (!tcp_recv_header(tcp_fd, resp_header)) {
+      break;
+    }
     if (resp_header.type != MsgType::PREFILL_RESPONSE) {
       fprintf(stderr, "期望 PREFILL_RESPONSE，收到 %d\n", (int)resp_header.type);
       break;
     }
     PrefillResponse resp;
-    if (!tcp_recv(tcp_fd, &resp, sizeof(resp))) break;
-    fprintf(stderr, "收到 PrefillResponse req_id=%d\n", resp.req_id);
+    if (!tcp_recv(tcp_fd, &resp, sizeof(resp))) {
+      break;
+    }
+    // 收到 first_token，TTFT 结束
+    auto t_ttft_end = std::chrono::steady_clock::now();
+    double ttft_ms = std::chrono::duration<double, std::milli>(t_ttft_end - t_ttft_start).count();
+    fprintf(stderr, "收到 PrefillResponse req_id=%d first_token=%d\n", resp.req_id,
+            resp.first_token);
+    fprintf(stderr, "TTFT: %.1fms（含 prefill + 采样 + TCP RTT）\n", ttft_ms);
 
     // ----------------------------------------------------------------
     // 4. 在 D节点 BlockPool 里分配 slots
@@ -196,7 +211,7 @@ int main(int argc, char** argv) {
       while (!r->finished) {
         // 确保有足够的 block
         {
-          int need = (r->pos + BLOCK_SIZE - 1) / BLOCK_SIZE;
+          int need = r->pos / BLOCK_SIZE + 1;
           while (r->block_table.num_blocks() < need) {
             int block_id = pool->allocate();
             if (block_id < 0) {
@@ -206,7 +221,9 @@ int main(int argc, char** argv) {
             }
             r->block_table.add_block(block_id);
           }
-          if (r->finished) break;
+          if (r->finished) {
+            break;
+          }
         }
 
         // 组装 flat batch（纯 decode，1个 token）
@@ -243,7 +260,9 @@ int main(int argc, char** argv) {
 
         // 输出当前 token
         const char* piece = decode(decoder->get_tokenizer(), r->cur_token);
-        if (piece) output += piece;
+        if (piece) {
+          output += piece;
+        }
 
         r->pos++;
         r->cur_token = next_token;
@@ -262,7 +281,6 @@ int main(int argc, char** argv) {
              input.c_str(), output.c_str());
     }
 
-  cleanup:
     r->block_table.free_blocks([pool](int id) { pool->free(id); });
     delete r;
     req_id++;

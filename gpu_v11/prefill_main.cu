@@ -164,10 +164,17 @@ int main(int argc, char** argv) {
       std::vector<int> changed = {0};
       decoder->update_block_table_partial(running_tmp, changed, decoder->get_max_blocks_per_seq());
 
+      // forward 之前
+      auto t_prefill_start = std::chrono::steady_clock::now();
+
       decoder->forward_flat(flat_reqs, flat_tokens, flat_positions, token_to_seq, slot_mapping,
                             last_tok_idx, dec_flat, dec_pos, dec_seq, n_tokens);
 
-      fprintf(stderr, "prefill 完成 req_id=%d\n", req_id);
+      auto t_prefill_end = std::chrono::steady_clock::now();
+      double prefill_ms =
+          std::chrono::duration<double, std::milli>(t_prefill_end - t_prefill_start).count();
+      fprintf(stderr, "prefill 完成 req_id=%d %.1fms (%.1f tokens/s)\n", req_id, prefill_ms,
+              n_tokens / prefill_ms * 1000);
 
       // forward 完成后采样
       float* logits = decoder->get_logits_batch(0);
