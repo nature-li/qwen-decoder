@@ -12,6 +12,7 @@
 | `decoder.h/cpp` | Decoder 基类，generate 逻辑 |
 | `scheduler.h/cpp` | 请求调度器，continuous batching 核心 |
 | `kv_cache.h/cpp` | BlockPool + BlockTable，PagedAttention KV cache 管理 |
+| `pd_comm.h/cpp` | P/D 分离通信，TCP 握手 + 多 NCCL stream 并发传输 |
 | `cpu_decoder.h/cpp` | CPU 版本实现 |
 | `gpu_v1/` | GPU 朴素版本，手写 fp16 matmul kernel |
 | `gpu_v2/` | GPU v2，cublasHgemm 替换手写 kernel |
@@ -23,6 +24,7 @@
 | `gpu_v8/` | GPU v8，continuous batching，动态请求调度 |
 | `gpu_v9/` | GPU v9，PagedAttention，KV cache 动态分页分配 |
 | `gpu_v10/` | GPU v10，1-flat 推理，chunked prefill，decode attention 并行 |
+| `gpu_v11/` | GPU v11，P/D 分离，多 NCCL stream 并发 KV cache 传输 |
 | `tests/` | softmax / attention 算法对比实现 |
 | `doc/` | nsys profile 截图 |
 | `CMakeLists.txt` | 构建配置 |
@@ -68,6 +70,7 @@
 - Linux
 - NVIDIA GPU + CUDA 12.x（需要至少 10GB 显存）
 - CMake 3.18+
+- NCCL 2.x（v11 P/D 分离需要）
 
 ## 编译
 
@@ -104,20 +107,15 @@ snapshot_download(
 运行：
 
 ```bash
-# 单请求
-./gpu_decoder_v6 qwen2.5-3b-instruct-fp16.gguf
-
-# fixed batch 多请求并发（batch_size=4）
-./gpu_decoder_v7 qwen2.5-3b-instruct-fp16.gguf 4
-
-# continuous batching（max_batch=4，请求数量可超过 max_batch）
-./gpu_decoder_v8 qwen2.5-3b-instruct-fp16.gguf 4
-
-# PagedAttention + continuous batching（max_batch=8）
-./gpu_decoder_v9 qwen2.5-3b-instruct-fp16.gguf 8
-
 # 1-flat 推理（max_batch=64，max_prefill_len=4096，max_prefill_tokens_per_step=512）
-./gpu_decoder_v10 qwen2.5-3b-instruct-fp16.gguf 64 4096 512
+./gpu_decoder_v11 qwen2.5-3b-instruct-fp16.gguf 64 4096 4096
+
+# P/D 分离：P节点先启动，D节点后启动
+# P节点（prefill）
+NCCL_SOCKET_IFNAME=eth0 ./prefill_node qwen2.5-3b-instruct-fp16.gguf
+
+# D节点（decode）
+NCCL_SOCKET_IFNAME=eth0 ./decode_node qwen2.5-3b-instruct-fp16.gguf <p_ip>
 ```
 
 ## 性能对比（Qwen2.5-3B fp16，RTX 5060 Ti 16GB，temperature=0）
@@ -133,8 +131,8 @@ snapshot_download(
 | GPU v4 | 48.99 | 6.8x | Flash Attention decode 阶段（无提升） |
 | GPU v5 | 53.12 | 7.4x | batch prefill，prefill 速度提升 18x |
 | GPU v6 | 52.60 | 7.3x | batch prefill + flash attention（反而更慢） |
-| GPU v7 | 209.34 | 29x | fixed batch decode, 4并发 |
-| GPU v8 | 168.0 | 23x | continuous batching, 4并发 |
+| GPU v7 | 209.34 | 29x | fixed batch decode，4并发 |
+| GPU v8 | 168.0 | 23x | continuous batching，4并发 |
 | GPU v9 | 869.9 | 121x | PagedAttention，64并发 |
 | GPU v10 | 1341.0 | 187x | 1-flat 推理，64并发 |
 
@@ -153,8 +151,9 @@ snapshot_download(
 | v6 | 1 | ~49% | ~51% | 单请求，decode memory-bound |
 | v7 | 4 | ~27% | ~73% | fixed batch，请求完成后槽位浪费 |
 | v8 | 4 | ~87% | ~13% | continuous batching，GPU 始终满载 |
-| v9 | 64 | ~90.7% | ~9.3% | PagedAttention，并发数翻倍 |
+| v9 | 64 | ~90.7% | ~9.3% | PagedAttention，并发数大幅提升 |
 | v10 | 64 | ~68.5% | ~31.5% | 1-flat，prefill 阶段 memcpy 较多 |
+| v11（D节点） | - | ~94.5% | ~5.5% | P/D 分离，D节点专注 decode |
 
 ## 优化分析
 
@@ -319,8 +318,6 @@ Kernels: 86.8%，Memory: 13.2%
 attention_batch_kernel: 8.6%
 ```
 
-与 vLLM 的 continuous batching 的区别：v8 的 KV cache 仍然是静态预分配的，每个请求固定占用 `seq_len` 的空间，存在显存碎片问题，v9 用 PagedAttention 解决了这个问题。
-
 ---
 
 ### GPU v8 → v9（PagedAttention，GPU 利用率 90.7%）
@@ -363,7 +360,7 @@ cuBLAS: 76.2%
 
 ### GPU v9 → v10（1-flat 推理，64并发，1341 tokens/s）
 
-v10 是目前最终版本，核心改动有四处：
+核心改动四处：
 
 **1. 1-flat 推理**
 
@@ -373,13 +370,10 @@ v10 是目前最终版本，核心改动有四处：
 v9：
   prefill：串行，一个请求 prefill 完再 prefill 下一个
   decode：batch，多个请求并发
-  两个阶段分开处理，每步有多次 kernel launch
 
 v10：
   flat batch = [req0_prefill_tokens..., req1_decode_token, req2_decode_token, ...]
   matmul/FFN 一次处理所有 token
-  prefill attention 按请求串行（causal mask 不同，无法合并）
-  decode attention 所有 token 一次并行 launch
 ```
 
 **2. chunked prefill**
@@ -389,33 +383,25 @@ v10：
 ```
 没有 chunked prefill：
   新请求进来，prompt=2000 tokens，一次性全部 prefill
-  total_tokens 突然变大，GPU 负载波动
+  total_tokens 突然变大，GPU 负载波动，decode 请求被饿死
 
 有 chunked prefill（max_prefill_tokens_per_step=512）：
-  每步最多 512 个 prefill token
-  total_tokens ≈ max_prefill_tokens_per_step + n_decode，始终稳定
-  同时降低 TTFT（首 token 延迟），prefill 和 decode 交替进行
+  每步最多 512 个 prefill token，和 decode 请求交替进行
+  total_tokens 始终稳定，TTFT 降低
 ```
 
 **3. decode attention 并行**
 
 ```
-v9（1-flat 之前的实现）：
-  for each decode request:
-      attention_paged_kernel(...)  ← 串行，每个请求单独 launch
-
-v10：
-  gather_q_kernel：从 q_flat 抽取所有 decode token 的 q → q_dec
-  decode_attention_kernel：一次 launch 处理所有 decode token（并行）
-  scatter_xb_kernel：decode attention 结果写回 xb_flat
+v9：for each decode request → attention kernel（串行 launch）
+v10：gather_q → 一次 launch 处理所有 decode token → scatter_xb
 ```
 
-**4. update_block_table 增量更新**
+**4. block_table 增量更新**
 
 ```
-v9：每步上传所有 max_batch 个槽位的 block_table，上传量大
-v10：只上传有变化的槽位，且每个槽位只传实际用到的 block 数
-     从 max_batch * max_blocks_per_seq * 4 bytes 降到几十 bytes
+v9：每步上传 max_batch * max_blocks_per_seq 个 int
+v10：只上传有变化的槽位的实际用到的 block 数
 ```
 
 **v10 nsys profile：**
@@ -428,16 +414,83 @@ cuBLAS: 74.4%
 decode_attention_kernel: 16.3%
 ```
 
-Memory 占比较高的原因是 prefill 阶段需要频繁上传 flat_tokens、flat_positions、slot_mapping 等元数据，decode 阶段稳定后 Kernels 占比明显提升。
+---
 
-**v9 vs v10 对比：**
+### GPU v10 → v11（P/D 分离，多 NCCL stream 并发）
+
+将 prefill 和 decode 分离到两台机器，P节点专注 prefill，D节点专注 decode：
 
 ```
-              v9（PagedAttention）   v10（1-flat + chunked prefill）
-并发数:        8                     64
-总吞吐:        ~870 tokens/s         ~1341 tokens/s
-Kernels:      90.7%                 68.5%
-Memory:        9.3%                 31.5%
+单机（v10）：
+  prefill 和 decode 竞争同一块 GPU
+  prefill 计算密集，会阻塞 decode，导致 decode 请求延迟抖动
+
+P/D 分离（v11）：
+  P节点（RTX 5060 Ti）：专注 prefill，算完 KV cache 传给 D节点
+  D节点（RTX 5060 Ti）：专注 decode，GPU 几乎全部用于 decode kernel
+```
+
+**通信架构：**
+
+```
+控制信息（TCP）：
+  D节点 → P节点：slot_id + req_id + prompt_tokens
+  P节点 → D节点：slot_id + req_id + n_tokens_done（结束信号）
+
+KV cache（多 NCCL stream 并发）：
+  每个 slot 独立的 NCCL 通信域和 CUDA stream
+  P节点 gather kernel → ncclSend(stream[slot_id])
+  D节点 ncclRecv(stream[slot_id]) → scatter kernel
+  多个请求的 KV cache 并发传输，互不阻塞
+```
+
+**KV cache 传输流程：**
+
+```
+P节点 prefill 完一个 chunk（max_prefill_len tokens）：
+  gather_kernel：PagePool 分散数据 → 连续 kv_buffer（GPU）
+  ncclSend：kv_buffer → D节点（GPU 到 GPU，1Gbps 网络）
+
+D节点接收：
+  ncclRecv：kv_buffer（GPU）
+  scatter_kernel：kv_buffer → D节点 PagePool
+  收到结束信号 → 请求加入 decode 队列
+```
+
+**v11 D节点 nsys profile：**
+
+![nsys v11 decode](doc/nsys-v11-decode.png)
+
+```
+Kernels: 94.5%，Memory: 5.5%
+Stream 13（decode）:  73.4% Kernels
+Stream 14（NCCL）:    21.4% Kernels（接收 KV cache）
+```
+
+**单机 vs D节点对比：**
+
+```
+              单机（v10）    D节点（v11）
+Kernels:      68.5%         94.5%  ← decode GPU 利用率大幅提升
+Memory:       31.5%          5.5%
+NCCL:         无            21.4%  ← KV cache 传输开销
+```
+
+D节点 GPU 利用率 94.5%，几乎全部用于 decode，是所有版本中最高的。21.4% 的 NCCL 开销来自 1Gbps 网络传输 KV cache，这也验证了 P/D 分离需要高带宽网络（RDMA）才能充分发挥优势。
+
+**1Gbps 网络下的 KV cache 传输时间：**
+
+```
+prompt=512 tokens 的 KV cache 大小：
+  512 * 36 * 256 * 2 * 2bytes = 18MB
+  1Gbps 网络传输时间 ≈ 144ms
+
+单机 prefill 512 tokens 时间：
+  512 / 1059 tokens/s ≈ 484ms
+
+结论：1Gbps 网络下，KV cache 传输时间远小于 prefill 时间
+     P/D 分离在此场景下可以正常工作
+     若需要真正的低延迟 P/D 分离，需要 RDMA（100Gbps+）
 ```
 
 ## Attention shared memory 限制

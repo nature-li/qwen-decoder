@@ -47,8 +47,8 @@ macro(add_pd_target target)
 endmacro()
 
 add_cuda_target(gpu_decoder_v15
-    gpu_v15//gpu_decoder.cu
-    gpu_v15//gpu_main.cu
+    gpu_v11/gpu_decoder.cu
+    gpu_v11/gpu_main.cu
     decoder.cpp 
     common.cpp 
     gguf_loader.cpp 
@@ -56,9 +56,9 @@ add_cuda_target(gpu_decoder_v15
     kv_cache.cpp)
 
 add_pd_target(prefill_node
-    gpu_v15//prefill_main.cu
-    gpu_v15//gpu_decoder.cu
-    gpu_v15//pd_comm.cpp
+    gpu_v11/prefill_main.cu
+    gpu_v11/gpu_decoder.cu
+    gpu_v11/pd_comm.cpp
     decoder.cpp 
     common.cpp 
     gguf_loader.cpp 
@@ -66,9 +66,9 @@ add_pd_target(prefill_node
     kv_cache.cpp)
 
 add_pd_target(decode_node
-    gpu_v15//decode_main.cu
-    gpu_v15//gpu_decoder.cu
-    gpu_v15//pd_comm.cpp
+    gpu_v11/decode_main.cu
+    gpu_v11/gpu_decoder.cu
+    gpu_v11/pd_comm.cpp
     decoder.cpp 
     common.cpp 
     gguf_loader.cpp 
