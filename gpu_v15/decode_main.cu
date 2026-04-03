@@ -25,34 +25,24 @@ struct SharedState {
   std::atomic<int> total_output_tokens{0};
 };
 
-// ============================================================================
-// ReqInfo：tokenize 后的请求信息
-// ============================================================================
-struct ReqInfo {
-  int req_id;
-  int n_tokens;
-  std::vector<int> prompt_tokens;
-  std::string input;
-};
-
 // encode 后的请求队列
 struct EncodeQueue {
   std::mutex mu;
   std::condition_variable cv;
-  std::queue<ReqInfo> q;
+  std::queue<Request*> q;
   bool closed = false;
 
-  void push(ReqInfo info) {
+  void push(Request* req) {
     std::lock_guard<std::mutex> lock(mu);
-    q.push(std::move(info));
+    q.push(std::move(req));
     cv.notify_one();
   }
 
-  bool pop(ReqInfo& info) {
+  bool pop(Request** req) {
     std::unique_lock<std::mutex> lock(mu);
     cv.wait(lock, [&] { return !q.empty() || closed; });
     if (q.empty()) return false;
-    info = std::move(q.front());
+    *req = std::move(q.front());
     q.pop();
     return true;
   }
@@ -68,13 +58,13 @@ struct EncodeQueue {
 // D节点发送线程
 // ============================================================================
 void d_send_thread_func(EncodeQueue& encode_queue, DNode& dnode) {
-  ReqInfo info;
-  while (encode_queue.pop(info)) {
+  Request* req = nullptr;
+  while (encode_queue.pop(&req)) {
     PrefillRequest req_msg;
-    req_msg.req_id = info.req_id;
-    req_msg.n_tokens = info.n_tokens;
-    dnode.send_request(req_msg, info.prompt_tokens);
-    fprintf(stderr, "[D.send] req_id=%d n_tokens=%d\n", info.req_id, info.n_tokens);
+    req_msg.req_id = req->id;
+    req_msg.n_tokens = req->prompt_tokens.size();
+    dnode.send_request(req_msg, req->prompt_tokens);
+    fprintf(stderr, "[D.send] req_id=%d n_tokens=%d\n", req->id, req->prompt_tokens.size());
   }
   fprintf(stderr, "[D.send] 线程退出\n");
 }
@@ -85,7 +75,7 @@ void d_send_thread_func(EncodeQueue& encode_queue, DNode& dnode) {
 void d_recv_thread_func(std::atomic<int>& total_requests, std::atomic<bool>& encode_done,
                         GPUDecoder* decoder, NcclComm& nccl, DNode& dnode, BlockPool* pool,
                         int n_layers, int kv_dim, SharedState& state,
-                        std::vector<ReqInfo>& all_reqs, std::mutex& reqs_mu) {
+                        std::vector<Request*>& all_reqs, std::mutex& reqs_mu) {
   int received = 0;
   while (true) {
     // 等到 encode 完成或者还有请求没收
@@ -95,22 +85,22 @@ void d_recv_thread_func(std::atomic<int>& total_requests, std::atomic<bool>& enc
     if (!dnode.recv_response(resp)) break;
 
     // 从 all_reqs 里找对应的 req
-    ReqInfo info;
+    Request* req = nullptr;
     {
       std::lock_guard<std::mutex> lock(reqs_mu);
       // 按顺序收，resp.req_id 就是 received
-      info = all_reqs[received];
+      req = all_reqs[received];
     }
 
     auto* r = new Request();
     r->id = resp.req_id;
-    r->pos = info.n_tokens;
+    r->pos = req->prompt_tokens.size();
     r->prefill_done = true;
     r->finished = false;
     r->cur_token = resp.first_token;
-    r->input = info.input;
+    r->input = req->input;
 
-    int need_blocks = (info.n_tokens - 1) / BLOCK_SIZE + 1;
+    int need_blocks = (req->prompt_tokens.size() - 1) / BLOCK_SIZE + 1;
     bool oom = false;
     for (int i = 0; i < need_blocks; i++) {
       int block_id = pool->allocate();
@@ -125,19 +115,20 @@ void d_recv_thread_func(std::atomic<int>& total_requests, std::atomic<bool>& enc
       break;
     }
 
-    std::vector<int> slots(info.n_tokens);
-    for (int j = 0; j < info.n_tokens; j++) {
+    std::vector<int> slots(req->prompt_tokens.size());
+    for (int j = 0; j < req->prompt_tokens.size(); j++) {
       slots[j] = r->block_table.physical_idx(j) * BLOCK_SIZE + r->block_table.block_offset(j);
     }
 
     auto t_kv_start = std::chrono::steady_clock::now();
-    nccl_recv_kv(nccl, pool->get_k_cache(), pool->get_v_cache(), slots, info.n_tokens, n_layers,
-                 kv_dim);
+    nccl_recv_kv(nccl, pool->get_k_cache(), pool->get_v_cache(), slots, req->prompt_tokens.size(),
+                 n_layers, kv_dim);
     auto t_kv_end = std::chrono::steady_clock::now();
     double kv_ms = std::chrono::duration<double, std::milli>(t_kv_end - t_kv_start).count();
-    double kv_mb = (double)info.n_tokens * n_layers * kv_dim * 2 * sizeof(__half) / 1024 / 1024;
-    fprintf(stderr, "[D.recv] req_id=%d KV: %.1fMB in %.1fms (%.1f MB/s)\n", resp.req_id, kv_mb,
-            kv_ms, kv_mb / kv_ms * 1000);
+    double kv_mb =
+        (double)req->prompt_tokens.size() * n_layers * kv_dim * 2 * sizeof(__half) / 1024 / 1024;
+    // fprintf(stderr, "[D.recv] req_id=%d KV: %.1fMB in %.1fms (%.1f MB/s)\n", resp.req_id, kv_mb,
+    //         kv_ms, kv_mb / kv_ms * 1000);
 
     {
       std::lock_guard<std::mutex> lock(state.mu);
@@ -166,6 +157,8 @@ void decode_thread_func(GPUDecoder* decoder, BlockPool* pool, int max_batch, int
   double total_fwd_s = 0.0;
 
   auto t_start = std::chrono::steady_clock::now();
+
+  auto last_step_time = std::chrono::steady_clock::now();
   while (completed < total_requests) {
     std::vector<int> changed;
 
@@ -276,8 +269,12 @@ void decode_thread_func(GPUDecoder* decoder, BlockPool* pool, int max_batch, int
     if (!changed.empty()) decoder->update_block_table_partial(running, changed, max_blk);
 
     // generate_continuous 里 forward_flat 调用前加
-    fprintf(stdout, "step %d: total_tokens=%d n_decode=%d n_prefill=%d prefill_tokens=%d\n", steps,
-            (int)flat_tokens.size(), (int)dec_pos.size(),
+    auto now = std::chrono::steady_clock::now();
+    double between = std::chrono::duration<double, std::milli>(now - last_step_time).count();
+    last_step_time = now;
+    fprintf(stdout,
+            "between: %.2f, step %d: total_tokens=%d n_decode=%d n_prefill=%d prefill_tokens=%d\n",
+            between, steps, (int)flat_tokens.size(), (int)dec_pos.size(),
             (int)flat_reqs.size() - (int)dec_pos.size(),
             (int)flat_tokens.size() - (int)dec_pos.size());
 
@@ -323,10 +320,9 @@ void decode_thread_func(GPUDecoder* decoder, BlockPool* pool, int max_batch, int
         printf("request id: %d\nprompt: %s\noutput: %s\n--------------------\n", r->id,
                r->input.c_str(), r->output.c_str());
         r->block_table.free_blocks([pool](int id) { pool->free(id); });
-        delete r;
         running[i] = nullptr;
         completed++;
-        fprintf(stderr, "[decode] 完成 %d/%d\n", completed, total_requests);
+        // fprintf(stderr, "[decode] 完成 %d/%d\n", completed, total_requests);
       }
     }
   }
@@ -399,12 +395,22 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  std::vector<Request*> all_requests;
+  for (int i = 0; i < (int)user_inputs.size(); i++) {
+    auto* req = new Request();
+    req->id = i;
+    req->input = user_inputs[i];
+    std::string prompt = apply_chat_template(user_inputs[i]);
+    decoder->encode_pub(prompt, req->prompt_tokens);
+    req->prompt_tokens.insert(req->prompt_tokens.begin(), decoder->get_tokenizer().bos_token_id);
+    all_requests.push_back(req);
+  }
+
   fprintf(stderr, "%d requests\n", (int)user_inputs.size());
 
   // 共享状态
   SharedState state;
   EncodeQueue encode_queue;
-  std::vector<ReqInfo> all_reqs;
   std::mutex reqs_mu;
   std::atomic<int> total_requests{0};
   std::atomic<bool> encode_done{false};
@@ -418,33 +424,22 @@ int main(int argc, char** argv) {
 
   std::thread recv_th(d_recv_thread_func, std::ref(total_requests), std::ref(encode_done), decoder,
                       std::ref(nccl), std::ref(dnode), pool, n_layers, kv_dim, std::ref(state),
-                      std::ref(all_reqs), std::ref(reqs_mu));
+                      std::ref(all_requests), std::ref(reqs_mu));
 
   std::thread decode_th(decode_thread_func, decoder, pool, max_batch, max_new_toks, temperature,
                         top_k, (int)user_inputs.size(), std::ref(state));
 
   // main 线程：encode 一条放一条，立刻送给 send 线程
   auto encode_start = std::chrono::steady_clock::now();
-  for (int i = 0; i < (int)user_inputs.size(); i++) {
-    ReqInfo info;
-    info.req_id = i;
-    info.input = user_inputs[i];
-    std::string prompt = decoder->apply_chat_template_pub(user_inputs[i]);
-    decoder->encode_pub(prompt, info.prompt_tokens);
-    info.prompt_tokens.insert(info.prompt_tokens.begin(), decoder->get_tokenizer().bos_token_id);
-    info.n_tokens = (int)info.prompt_tokens.size();
-
-    // 放入 all_reqs（recv 线程查询 n_tokens 用）
-    {
-      std::lock_guard<std::mutex> lock(reqs_mu);
-      all_reqs.push_back(info);
-    }
+  for (int i = 0; i < (int)all_requests.size(); i++) {
+    Request* req = all_requests[i];
+    req->id = i;
     total_requests++;
 
     // 放入 encode_queue（send 线程消费）
-    encode_queue.push(info);
+    encode_queue.push(req);
 
-    fprintf(stderr, "[main] encode req_id=%d n_tokens=%d\n", info.req_id, info.n_tokens);
+    fprintf(stderr, "[main] encode req_id=%d n_tokens=%d\n", req->id, req->prompt_tokens.size());
   }
   auto encode_end = std::chrono::steady_clock::now();
   double encode_elapsed = std::chrono::duration<double>(encode_end - encode_start).count();

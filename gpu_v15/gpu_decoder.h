@@ -141,6 +141,7 @@ class GPUDecoder : public Decoder {
   Weights w;
   GPUWeights gw;
   GPURunState gs;
-  cublasHandle_t cublas_handle;
   BlockPool* block_pool;
+  cublasHandle_t cublas_handle;
+  cudaStream_t stream;
 };

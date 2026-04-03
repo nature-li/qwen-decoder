@@ -31,6 +31,7 @@ void Decoder::generate_continuous(std::vector<std::string>& user_inputs, int max
   int max_pps = get_max_prefill_tokens_per_step();
 
   int step = 0;
+  auto last_step_time = std::chrono::steady_clock::now();
   while (!scheduler.all_done()) {
     // 把 waiting 队列里的请求填入空槽
     scheduler.fill_slots();
@@ -172,8 +173,12 @@ void Decoder::generate_continuous(std::vector<std::string>& user_inputs, int max
     update_block_table_partial(scheduler.running(), scheduler.last_changed, max_blk);
 
     // generate_continuous 里 forward_flat 调用前加
-    fprintf(stdout, "step %d: total_tokens=%d n_decode=%d n_prefill=%d prefill_tokens=%d\n", step,
-            (int)flat_tokens.size(), (int)decode_positions.size(),
+    auto now = std::chrono::steady_clock::now();
+    double between = std::chrono::duration<double, std::milli>(now - last_step_time).count();
+    last_step_time = now;
+    fprintf(stdout,
+            "between %.02f, step %d: total_tokens=%d n_decode=%d n_prefill=%d prefill_tokens=%d\n",
+            between, step, (int)flat_tokens.size(), (int)decode_positions.size(),
             (int)flat_requests.size() - (int)decode_positions.size(),
             (int)flat_tokens.size() - (int)decode_positions.size());
 
