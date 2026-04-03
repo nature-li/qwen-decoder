@@ -272,6 +272,7 @@ void decode_thread_func(GPUDecoder* decoder, BlockPool* pool, int max_batch, int
       decoder->update_block_table_partial(running, changed, max_blk);
     }
 
+    std::cout << "step: " << step << ", requests: " << flat_reqs.size() << ", total_tokens:" << flat_tokens.size() << std::endl;
     // forward
     decoder->forward_flat(flat_reqs, flat_tokens, flat_positions, token_to_seq, slot_mapping,
                           last_tok_idx, dec_flat, dec_pos, dec_seq, (int)flat_tokens.size());
@@ -339,7 +340,7 @@ int main(int argc, char** argv) {
 
   const char* model_file = argv[1];
   const char* prefill_node_ip = argv[2];
-  int max_batch = (argc >= 4) ? atoi(argv[3]) : 8;
+  int max_batch = (argc >= 4) ? atoi(argv[3]) : 64;
 
   int max_pps = 512;
   int max_total_tokens = max_batch + max_pps;
