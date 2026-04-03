@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <iostream>
 #include <vector>
 
 void Decoder::generate_continuous(std::vector<std::string>& user_inputs, int max_batch,

@@ -85,6 +85,11 @@ class Decoder {
   virtual BlockPool* get_block_pool() { return nullptr; }
 
   /**
+   * 返回最大并发数
+   */
+  virtual int get_max_batch() const {return 0;}
+
+  /**
    * 返回单个请求最多占用多少个逻辑块
    * 由 seq_len 和 BLOCK_SIZE 决定：(seq_len + BLOCK_SIZE - 1) / BLOCK_SIZE
    * 用于分配 block_table_gpu 的每行大小
