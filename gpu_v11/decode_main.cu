@@ -105,6 +105,8 @@ int main(int argc, char** argv) {
   int total_output_tokens = 0;
   int req_id = 0;
 
+  double total_kv_ms = 0;    // 所有请求 KV 传输时间
+  double total_ttft_ms = 0;  // 所有请求 TTFT
   for (auto& input : user_inputs) {
     // ----------------------------------------------------------------
     // 1. tokenize
@@ -129,7 +131,6 @@ int main(int argc, char** argv) {
 
     // 发送 PrefillRequest 之前记录开始时间
     auto t_ttft_start = std::chrono::steady_clock::now();
-
     tcp_send_msg(tcp_fd, MsgType::PREFILL_REQUEST, body.data(), body_size);
     fprintf(stderr, "已发送 PrefillRequest\n");
 
@@ -151,6 +152,7 @@ int main(int argc, char** argv) {
     // 收到 first_token，TTFT 结束
     auto t_ttft_end = std::chrono::steady_clock::now();
     double ttft_ms = std::chrono::duration<double, std::milli>(t_ttft_end - t_ttft_start).count();
+    total_ttft_ms += ttft_ms;
     fprintf(stderr, "收到 PrefillResponse req_id=%d first_token=%d\n", resp.req_id,
             resp.first_token);
     fprintf(stderr, "TTFT: %.1fms（含 prefill + 采样 + TCP RTT）\n", ttft_ms);
@@ -189,13 +191,14 @@ int main(int argc, char** argv) {
       // 5. 通过 NCCL 接收 KV cache，写入本地 BlockPool
       // ----------------------------------------------------------------
       fprintf(stderr, "开始接收 KV cache...\n");
-      auto t0 = std::chrono::steady_clock::now();
-
+      auto t_kv_start = std::chrono::steady_clock::now();
       nccl_recv_kv(nccl, pool->get_k_cache(), pool->get_v_cache(), slots, n_tokens, n_layers,
                    kv_dim);
+      auto t_kv_end = std::chrono::steady_clock::now();
+      double kv_ms = std::chrono::duration<double, std::milli>(t_kv_end - t_kv_start).count();
+      total_kv_ms += kv_ms;
 
-      auto t1 = std::chrono::steady_clock::now();
-      double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+      double ms = kv_ms;
       double mb = (double)n_tokens * n_layers * kv_dim * 2 * sizeof(__half) / 1024 / 1024;
       fprintf(stderr, "KV cache 接收完成：%.1fMB in %.1fms (%.1f MB/s)\n", mb, ms, mb / ms * 1000);
     }
@@ -205,6 +208,7 @@ int main(int argc, char** argv) {
     // ----------------------------------------------------------------
     // 7. decode 循环
     // ----------------------------------------------------------------
+    auto t_decode_start = std::chrono::steady_clock::now();
     {
       std::string output;
 
@@ -289,8 +293,14 @@ int main(int argc, char** argv) {
 done:
   auto t_end = std::chrono::steady_clock::now();
   double elapsed = std::chrono::duration<double>(t_end - t_start).count();
-  fprintf(stderr, "total: %d tokens in %.2fs (%.1f tokens/s)\n", total_output_tokens, elapsed,
-          total_output_tokens / elapsed);
+  double kv_elapsed = total_kv_ms / 1000.0;
+
+  // 去掉 KV 传输时间
+  fprintf(stderr, "decode: %d tokens in %.2fs (%.1f tokens/s)\n", total_output_tokens,
+          elapsed - kv_elapsed, total_output_tokens / (elapsed - kv_elapsed));
+  fprintf(stderr, "avg TTFT: %.1fms\n", total_ttft_ms / user_inputs.size());
+  fprintf(stderr, "avg KV transfer: %.1fms\n", total_kv_ms / user_inputs.size());
+  fprintf(stderr, "end-to-end: %.2fs\n", elapsed);
 
   tcp_send_msg(tcp_fd, MsgType::SHUTDOWN, nullptr, 0);
   close(tcp_fd);
