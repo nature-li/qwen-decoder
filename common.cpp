@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <list>
+#include <queue>
 
 #include "gguf_loader.h"
 
@@ -41,8 +43,7 @@ int load_config(Config& config, const GGUFFile& gguf) {
       return 0;
     }
     if (it->second.type != GGUF_TYPE_UINT32) {
-      fprintf(stderr, "key %s type=%d, expected UINT32\n", key.c_str(),
-              it->second.type);
+      fprintf(stderr, "key %s type=%d, expected UINT32\n", key.c_str(), it->second.type);
       return 0;
     }
     return it->second.u32;
@@ -55,8 +56,7 @@ int load_config(Config& config, const GGUFFile& gguf) {
       return 0.0f;
     }
     if (it->second.type != GGUF_TYPE_FLOAT32) {
-      fprintf(stderr, "key %s type=%d, expected FLOAT32\n", key.c_str(),
-              it->second.type);
+      fprintf(stderr, "key %s type=%d, expected FLOAT32\n", key.c_str(), it->second.type);
       return 0.0f;
     }
     return it->second.f32;
@@ -91,8 +91,7 @@ int load_config(Config& config, const GGUFFile& gguf) {
 }
 
 // 根据张量名找到数据指针
-static void* find_tensor(const GGUFFile& gguf, const ModelFile& mf,
-                         const std::string& name) {
+static void* find_tensor(const GGUFFile& gguf, const ModelFile& mf, const std::string& name) {
   for (auto& t : gguf.tensors) {
     if (t.name == name) {
       return (char*)mf.data + gguf.data_offset + t.offset;
@@ -111,8 +110,7 @@ static void* find_tensor(const GGUFFile& gguf, const ModelFile& mf,
  *
  * 如需支持量化模型 (q4/q8)，应根据 TensorInfo.type 动态判断类型
  */
-int load_weights(Weights& w, const Config& config, const GGUFFile& gguf,
-                 const ModelFile& mf) {
+int load_weights(Weights& w, const Config& config, const GGUFFile& gguf, const ModelFile& mf) {
   int head_dim = config.dim / config.n_heads;
   int kv_dim = config.n_kv_heads * head_dim;
 
@@ -273,6 +271,15 @@ int load_tokenizer(Tokenizer& t, const GGUFFile& gguf) {
 
   // printf("vocab_size     = %d\n", t.vocab_size);
 
+  // 预建 vocab_map
+  for (int i = 0; i < t.vocab_size; i++) {
+    t.vocab_map[t.vocab[i]] = i;
+  }
+
+  // 预建 merge_rank
+  for (int i = 0; i < (int)t.merges.size(); i++) {
+    t.merge_rank[t.merges[i]] = i;
+  }
   return 0;
 }
 
@@ -388,7 +395,7 @@ int vocab_lookup(const Tokenizer& t, const std::string& str) {
 int encode(Tokenizer& t, const std::string& text, std::vector<int>& tokens) {
   tokens.clear();
 
-  // 1. 收集特殊 token，按长度从长到短排序
+  // 1. 收集特殊 token，按长度从长到短排序（只做一次，但这里每次都排，可以预建）
   std::vector<std::pair<std::string, int>> special_tokens;
   for (int i = 0; i < t.vocab_size; i++) {
     if (t.token_type[i] == 3) {
@@ -396,9 +403,7 @@ int encode(Tokenizer& t, const std::string& text, std::vector<int>& tokens) {
     }
   }
   std::sort(special_tokens.begin(), special_tokens.end(),
-            [](const auto& a, const auto& b) {
-              return a.first.size() > b.first.size();
-            });
+            [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
 
   // 2. 把文本按特殊 token 分割成多段
   std::vector<std::string> segments;
@@ -408,7 +413,7 @@ int encode(Tokenizer& t, const std::string& text, std::vector<int>& tokens) {
   while (!remaining.empty()) {
     bool found = false;
     for (auto& [sp, id] : special_tokens) {
-      if (remaining.substr(0, sp.size()) == sp) {
+      if (remaining.size() >= sp.size() && remaining.substr(0, sp.size()) == sp) {
         segments.push_back(sp);
         is_special.push_back(true);
         remaining = remaining.substr(sp.size());
@@ -417,7 +422,6 @@ int encode(Tokenizer& t, const std::string& text, std::vector<int>& tokens) {
       }
     }
     if (!found) {
-      // 找到下一个特殊 token 的位置
       size_t next_special = remaining.size();
       for (auto& [sp, id] : special_tokens) {
         size_t pos = remaining.find(sp);
@@ -431,35 +435,26 @@ int encode(Tokenizer& t, const std::string& text, std::vector<int>& tokens) {
     }
   }
 
-  // 3. 预建 merge_rank
-  std::unordered_map<std::string, int> merge_rank;
-  for (int i = 0; i < (int)t.merges.size(); i++) {
-    merge_rank[t.merges[i]] = i;
-  }
+  // 3. 对每段分别处理
+  const auto& b2u = get_byte_to_unicode();
 
-  // 4. 对每段分别处理
   for (int si = 0; si < (int)segments.size(); si++) {
     if (is_special[si]) {
-      // 特殊 token 直接查词表
-      int id = vocab_lookup(t, segments[si]);
-      if (id != -1) tokens.push_back(id);
+      // 特殊 token 直接查 vocab_map
+      auto it = t.vocab_map.find(segments[si]);
+      if (it != t.vocab_map.end()) tokens.push_back(it->second);
       continue;
     }
 
-    // 普通文本走 BPE
-    std::vector<int> seg_tokens;
-
-    // 替换所有字节为对应 unicode
-    const auto& b2u = get_byte_to_unicode();
+    // 普通文本：bytes → unicode → UTF-8 字符初始化 token ids
     std::string processed;
     for (unsigned char c : segments[si]) {
       auto it = b2u.find((char)c);
-      if (it != b2u.end()) {
-        processed += it->second;
-      }
+      if (it != b2u.end()) processed += it->second;
     }
 
-    // 按 UTF-8 字符初始化
+    // 按 UTF-8 字符初始化 ids
+    std::vector<int> ids;
     int i = 0;
     while (i < (int)processed.size()) {
       unsigned char c = (unsigned char)processed[i];
@@ -474,47 +469,87 @@ int encode(Tokenizer& t, const std::string& text, std::vector<int>& tokens) {
         char_len = 4;
 
       std::string ch = processed.substr(i, char_len);
-      int id = vocab_lookup(t, ch);
-      if (id != -1) {
-        seg_tokens.push_back(id);
+      auto it = t.vocab_map.find(ch);
+      if (it != t.vocab_map.end()) {
+        ids.push_back(it->second);
       } else {
-        // 找不到就按字节逐个用 <0xXX> 兜底
         for (int b = 0; b < char_len; b++) {
           unsigned char byte = (unsigned char)processed[i + b];
           char buf[8];
           snprintf(buf, sizeof(buf), "<0x%02X>", byte);
-          int byte_id = vocab_lookup(t, buf);
-          if (byte_id != -1) seg_tokens.push_back(byte_id);
+          auto bit = t.vocab_map.find(buf);
+          if (bit != t.vocab_map.end()) ids.push_back(bit->second);
         }
       }
       i += char_len;
     }
 
-    // BPE merge
-    while (true) {
-      int best_rank = INT_MAX;
-      int best_idx = -1;
-      int best_id = -1;
+    if (ids.empty()) continue;
 
-      for (int j = 0; j < (int)seg_tokens.size() - 1; j++) {
-        std::string pair =
-            t.vocab[seg_tokens[j]] + " " + t.vocab[seg_tokens[j + 1]];
-        auto it = merge_rank.find(pair);
-        if (it != merge_rank.end() && it->second < best_rank) {
-          best_rank = it->second;
-          best_idx = j;
-          std::string merged =
-              t.vocab[seg_tokens[j]] + t.vocab[seg_tokens[j + 1]];
-          best_id = vocab_lookup(t, merged);
-        }
-      }
-
-      if (best_idx == -1) break;
-      seg_tokens[best_idx] = best_id;
-      seg_tokens.erase(seg_tokens.begin() + best_idx + 1);
+    // BPE merge：优先队列 + 链表，O(n logn)
+    int n = (int)ids.size();
+    std::vector<int> nxt(n), prv(n);
+    std::vector<bool> deleted(n, false);
+    for (int j = 0; j < n; j++) {
+      nxt[j] = j + 1;
+      prv[j] = j - 1;
     }
 
-    for (int id : seg_tokens) tokens.push_back(id);
+    // MergeItem：(rank, pos, left_id, right_id)
+    // lazy deletion：取出时检查 ids[pos]==left && ids[nxt[pos]]==right
+    struct MergeItem {
+      int rank, pos, left, right;
+      bool operator>(const MergeItem& o) const { return rank > o.rank; }
+    };
+    std::priority_queue<MergeItem, std::vector<MergeItem>, std::greater<MergeItem>> pq;
+
+    // 初始化所有相邻 pair
+    auto try_push = [&](int pos) {
+      if (pos < 0 || pos >= n || deleted[pos]) return;
+      int r = nxt[pos];
+      if (r >= n || deleted[r]) return;
+      std::string pair = t.vocab[ids[pos]] + " " + t.vocab[ids[r]];
+      auto it = t.merge_rank.find(pair);
+      if (it != t.merge_rank.end()) {
+        pq.push({it->second, pos, ids[pos], ids[r]});
+      }
+    };
+
+    for (int j = 0; j < n - 1; j++) try_push(j);
+
+    // BPE merge 主循环
+    while (!pq.empty()) {
+      auto [rank, pos, left, right] = pq.top();
+      pq.pop();
+
+      // lazy deletion 检查
+      if (deleted[pos]) continue;
+      int r = nxt[pos];
+      if (r >= n || deleted[r]) continue;
+      if (ids[pos] != left || ids[r] != right) continue;
+
+      // 执行 merge：把 left+right 合并到 pos，删除 r
+      std::string merged = t.vocab[left] + t.vocab[right];
+      auto mit = t.vocab_map.find(merged);
+      if (mit == t.vocab_map.end()) continue;
+      ids[pos] = mit->second;
+
+      // 删除 r，更新链表
+      deleted[r] = true;
+      int rr = nxt[r];
+      nxt[pos] = rr;
+      if (rr < n) prv[rr] = pos;
+
+      // 检查左边新 pair
+      try_push(prv[pos]);
+      // 检查右边新 pair（pos 已经更新为 merged）
+      try_push(pos);
+    }
+
+    // 收集结果
+    for (int j = 0; j < n; j++) {
+      if (!deleted[j]) tokens.push_back(ids[j]);
+    }
   }
 
   return 0;
@@ -540,8 +575,7 @@ int argmax(const float* logits, int size) {
   return max_idx;
 }
 
-int sample_topk(const float* logits, int size, int k, float temperature,
-                std::mt19937& rng) {
+int sample_topk(const float* logits, int size, int k, float temperature, std::mt19937& rng) {
   if (temperature == 0.0f) {
     return argmax(logits, size);
   }
@@ -567,8 +601,7 @@ int sample_topk(const float* logits, int size, int k, float temperature,
 
   // 1. 找第 k 大的阈值
   std::vector<float> tmp(logits, logits + size);
-  std::nth_element(tmp.begin(), tmp.begin() + k - 1, tmp.end(),
-                   std::greater<float>());
+  std::nth_element(tmp.begin(), tmp.begin() + k - 1, tmp.end(), std::greater<float>());
   float threshold = tmp[k - 1];
 
   // 2. 只保留 top-k，其余归零

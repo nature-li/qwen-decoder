@@ -59,11 +59,13 @@ struct ModelFile {
 // ============================================================================
 struct Tokenizer {
   int vocab_size;
-  std::vector<std::string> vocab;   // token 字符串
-  std::vector<std::string> merges;  // BPE merge 规则，顺序就是优先级
-  std::vector<int> token_type;      // token 类型
-  int bos_token_id;                 // 151643
-  int eos_token_id;                 // 151645
+  std::vector<std::string> vocab;                   // token 字符串
+  std::vector<std::string> merges;                  // BPE merge 规则，顺序就是优先级
+  std::vector<int> token_type;                      // token 类型
+  int bos_token_id;                                 // 151643
+  int eos_token_id;                                 // 151645
+  std::unordered_map<std::string, int> vocab_map;   // vocab 反查，O(1)
+  std::unordered_map<std::string, int> merge_rank;  // merge rank 查找，O(1)
 };
 
 // GPT2 bytes_to_unicode 映射表
@@ -80,11 +82,9 @@ void close_model(ModelFile& mf);
 int load_config(Config& config, const GGUFFile& gguf);
 
 // 根据张量名找到数据指针
-static void* find_tensor(const GGUFFile& gguf, const ModelFile& mf,
-                         const std::string& name);
+static void* find_tensor(const GGUFFile& gguf, const ModelFile& mf, const std::string& name);
 
-int load_weights(Weights& w, const Config& config, const GGUFFile& gguf,
-                 const ModelFile& mf);
+int load_weights(Weights& w, const Config& config, const GGUFFile& gguf, const ModelFile& mf);
 
 void free_weights(Weights& w);
 
@@ -99,5 +99,4 @@ int encode(Tokenizer& t, const std::string& text, std::vector<int>& tokens);
 std::string apply_chat_template(const std::string& user_input);
 
 int argmax(const float* logits, int size);
-int sample_topk(const float* logits, int size, int k, float temperature,
-                std::mt19937& rng);
+int sample_topk(const float* logits, int size, int k, float temperature, std::mt19937& rng);
