@@ -137,8 +137,8 @@ void p_prefill_thread(GPUDecoder* decoder, BlockPool* pool, SafeQueue<PrefillTas
       running_tasks[i] = std::move(task);
       prefill_offset[i] = 0;
       changed.push_back(i);
-      fprintf(stderr, "[P.prefill] 加入 req_id=%d slot=%d n_tokens=%d\n", r->id, i,
-              running_tasks[i].n_tokens);
+      // fprintf(stderr, "[P.prefill] 加入 req_id=%d slot=%d n_tokens=%d\n", r->id, i,
+      //         running_tasks[i].n_tokens);
     }
 
     // running 全空时阻塞等一个
@@ -298,8 +298,8 @@ void p_prefill_thread(GPUDecoder* decoder, BlockPool* pool, SafeQueue<PrefillTas
           running[i] = nullptr;
           prefill_offset[i] = 0;
           completed++;
-          fprintf(stderr, "[P.prefill] 完成 req_id=%d slot=%d completed=%d\n", tk.req_id, i,
-                  completed);
+          // fprintf(stderr, "[P.prefill] 完成 req_id=%d slot=%d completed=%d\n", tk.req_id, i,
+          //         completed);
         }
       }
     }

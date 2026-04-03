@@ -206,7 +206,6 @@ void decode_thread_func(GPUDecoder* decoder, BlockPool* pool, int max_batch, int
         running[slot] = r;
         changed.push_back(slot);
         n_running++;
-        fprintf(stderr, "[decode] 加入请求 id=%d slot=%d\n", r->id, slot);
       }
     }
 
