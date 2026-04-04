@@ -1,6 +1,6 @@
 # qwen-decoder
 
-从零手写的 Qwen2.5 推理引擎，支持加载 GGUF 格式模型，提供 CPU C++、CUDA GPU 多个版本实现，记录了完整的性能优化过程。
+从零实现 Qwen2.5 推理引擎，实现 GGUF 解析、GPT2 BPE tokenizer、GQA attention、Flash Attention、PagedAttention、continuous batching 调度器、KV cache 动态分页、1-flat 推理 + chunked prefill、Prefix Cache（block 粒度 KV 复用 + LRU 淘汰）、P/D 分离（NCCL 多 stream 并发 KV cache 传输）；64并发总吞吐 1341 tokens/s，512并发 Prefix Cache 提升 20%（1972→2366 tokens/s），D节点 GPU 利用率 94.5%。
 
 ## 项目结构
 
@@ -9,9 +9,10 @@
 | `common.h` | 公共数据结构（Config、Weights、Tokenizer、ModelFile） |
 | `common.cpp` | 公共函数（GGUF 加载、BPE tokenizer、采样） |
 | `gguf_loader.h/cpp` | GGUF 文件格式解析 |
-| `decoder.h/cpp` | Decoder 基类，generate 逻辑 |
-| `scheduler.h/cpp` | 请求调度器，continuous batching 核心 |
-| `kv_cache.h/cpp` | BlockPool + BlockTable，PagedAttention KV cache 管理 |
+| `decoder.h/cpp` | Decoder 基类，generate_continuous 逻辑 |
+| `scheduler.h/cpp` | 请求调度器，continuous batching 核心，内置 Prefix Cache |
+| `kv_cache.h/cpp` | BlockPool + BlockTable，PagedAttention KV cache 管理，引用计数 |
+| `prefix_cache.h/cpp` | Prefix Cache，block 粒度 KV 复用，LRU 淘汰 |
 | `pd_comm.h/cpp` | P/D 分离通信，TCP 握手 + 多 NCCL stream 并发传输 |
 | `cpu_decoder.h/cpp` | CPU 版本实现 |
 | `gpu_v1/` | GPU 朴素版本，手写 fp16 matmul kernel |
@@ -25,6 +26,7 @@
 | `gpu_v9/` | GPU v9，PagedAttention，KV cache 动态分页分配 |
 | `gpu_v10/` | GPU v10，1-flat 推理，chunked prefill，decode attention 并行 |
 | `gpu_v11/` | GPU v11，P/D 分离，多 NCCL stream 并发 KV cache 传输 |
+| `gpu_v12/` | GPU v12，Prefix Cache KV 复用，支持单机和 P/D 分离两种模式 |
 | `tests/` | softmax / attention 算法对比实现 |
 | `doc/` | nsys profile 截图 |
 | `CMakeLists.txt` | 构建配置 |
@@ -53,24 +55,12 @@
 - SwiGLU FFN
 - Temperature + Top-K 采样
 
-## 与 llama2c-decoder 的主要差异
-
-| 特性 | llama2c-decoder | qwen-decoder |
-| :--- | :--- | :--- |
-| 文件格式 | llama2.c 自定义格式 | GGUF 标准格式 |
-| 权重精度 | float32 | fp16 |
-| Tokenizer | BPE（简单） | GPT2 BPE（bytes_to_unicode） |
-| Q/K/V bias | 无 | 有 |
-| RoPE theta | 10000 | 1000000 |
-| GQA | 可选 | 必须（n_kv_heads=2） |
-| 对话格式 | 无 | Chat template |
-
 ## 环境依赖
 
 - Linux
 - NVIDIA GPU + CUDA 12.x（需要至少 10GB 显存）
 - CMake 3.18+
-- NCCL 2.x（v11 P/D 分离需要）
+- NCCL 2.x（v11/v12 P/D 分离需要）
 
 ## 编译
 
@@ -107,15 +97,15 @@ snapshot_download(
 运行：
 
 ```bash
-# 1-flat 推理（max_batch=64，max_prefill_len=4096，max_prefill_tokens_per_step=512）
-./gpu_decoder_v11 qwen2.5-3b-instruct-fp16.gguf 64 4096 4096
+# 单机版（enable_prefix_cache=1 开启，0 关闭）
+./gpu_decoder_v12 qwen2.5-3b-instruct-fp16.gguf 64 4096 4096 4096 1
 
 # P/D 分离：P节点先启动，D节点后启动
-# P节点（prefill）
-NCCL_SOCKET_IFNAME=eth0 ./prefill_node qwen2.5-3b-instruct-fp16.gguf
+# P节点（prefill，enable_prefix_cache=1）
+NCCL_SOCKET_IFNAME=eth0 ./prefill_node_v12 qwen2.5-3b-instruct-fp16.gguf 1
 
 # D节点（decode）
-NCCL_SOCKET_IFNAME=eth0 ./decode_node qwen2.5-3b-instruct-fp16.gguf <p_ip>
+NCCL_SOCKET_IFNAME=eth0 ./decode_node_v12 qwen2.5-3b-instruct-fp16.gguf <p_ip>
 ```
 
 ## 性能对比（Qwen2.5-3B fp16，RTX 5060 Ti 16GB，temperature=0）
@@ -135,6 +125,15 @@ NCCL_SOCKET_IFNAME=eth0 ./decode_node qwen2.5-3b-instruct-fp16.gguf <p_ip>
 | GPU v8 | 168.0 | 23x | continuous batching，4并发 |
 | GPU v9 | 869.9 | 121x | PagedAttention，64并发 |
 | GPU v10 | 1341.0 | 187x | 1-flat 推理，64并发 |
+| GPU v12（单机）| 2366.6 | 330x | Prefix Cache，512并发 |
+
+### Prefix Cache 性能对比（512 并发，相同 prompt）
+
+| 模式 | 无 Prefix Cache | 有 Prefix Cache | 提升 |
+| :--- | :--- | :--- | :--- |
+| 单机（16路） | 582 tokens/s | 621 tokens/s | +6.7% |
+| 单机（512路） | 1972 tokens/s | 2366 tokens/s | +20% |
+| P/D 分离（512路） | 1574 tokens/s | 1783 tokens/s | +13% |
 
 ### prefill 阶段对比（prompt=3528 tokens）
 
@@ -154,6 +153,8 @@ NCCL_SOCKET_IFNAME=eth0 ./decode_node qwen2.5-3b-instruct-fp16.gguf <p_ip>
 | v9 | 64 | ~90.7% | ~9.3% | PagedAttention，并发数大幅提升 |
 | v10 | 64 | ~68.5% | ~31.5% | 1-flat，prefill 阶段 memcpy 较多 |
 | v11（D节点） | - | ~94.5% | ~5.5% | P/D 分离，D节点专注 decode |
+| v12（单机，无缓存）| 512 | ~96.1% | - | prefix cache 关闭 |
+| v12（单机，有缓存）| 512 | ~95.7% | - | prefix cache 开启 |
 
 ## 优化分析
 
@@ -444,19 +445,6 @@ KV cache（多 NCCL stream 并发）：
   多个请求的 KV cache 并发传输，互不阻塞
 ```
 
-**KV cache 传输流程：**
-
-```
-P节点 prefill 完一个 chunk（max_prefill_len tokens）：
-  gather_kernel：PagePool 分散数据 → 连续 kv_buffer（GPU）
-  ncclSend：kv_buffer → D节点（GPU 到 GPU，1Gbps 网络）
-
-D节点接收：
-  ncclRecv：kv_buffer（GPU）
-  scatter_kernel：kv_buffer → D节点 PagePool
-  收到结束信号 → 请求加入 decode 队列
-```
-
 **v11 D节点 nsys profile：**
 
 ![nsys v11 decode](doc/nsys-v11-decode.png)
@@ -491,6 +479,91 @@ prompt=512 tokens 的 KV cache 大小：
 结论：1Gbps 网络下，KV cache 传输时间远小于 prefill 时间
      P/D 分离在此场景下可以正常工作
      若需要真正的低延迟 P/D 分离，需要 RDMA（100Gbps+）
+```
+
+---
+
+### GPU v11 → v12（Prefix Cache，KV Cache 复用）
+
+实现 Prefix Caching（即 vLLM 的 Automatic Prefix Caching），相同前缀的请求直接复用已计算好的 KV Cache，跳过重复 prefill。
+
+**核心设计：**
+
+```
+以 block 为粒度缓存 KV，key 是前缀 token 序列的累积 hash：
+
+  prompt = [t0..t15, t16..t31, t32..t47]  (BLOCK_SIZE=16)
+
+  insert 时存入：
+    hash([t0..t15])   → 物理块 id=5
+    hash([t0..t31])   → 物理块 id=12
+
+  新请求命中：
+    match([t0..t15, t16..t31, t32..t63])
+    → 命中 block0(5) 和 block1(12)
+    → req->pos = 32，跳过前 32 个 token 的 prefill
+    → 只需计算 t32..t63
+```
+
+**引用计数管理物理块生命周期：**
+
+```
+普通分配：  ref_count = 1
+insert：    ref_count++（cache 持有一份引用）
+match 命中：ref_count++（新请求持有一份引用）
+请求完成：  ref_count--
+LRU 淘汰：  ref_count--
+降到 0：    真正释放回 BlockPool
+```
+
+**LRU 淘汰策略：**
+
+```
+命中时：移到链表头部（最近使用）
+cache 满时：淘汰链表尾部（最久未使用）
+经常复用的 prefix（如 system prompt）始终在头部不被淘汰
+```
+
+**支持开关控制：**
+
+```bash
+# 开启 prefix cache（默认）
+./gpu_decoder_v12 model.gguf 64 4096 4096 4096 1
+
+# 关闭 prefix cache（对照实验）
+./gpu_decoder_v12 model.gguf 64 4096 4096 4096 0
+```
+
+**性能提升（512 并发，相同 prompt）：**
+
+```
+单机版：  1972 → 2366 tokens/s  +20%
+P/D 分离：1574 → 1783 tokens/s  +13%
+```
+
+**提升来源分析：**
+
+```
+单机版提升主要来自：
+  跳过重复 prefill 计算
+  → 更快完成 prefill，ready_queue 更快填满
+  → batch size 变大（64.6 → 71.5），总步数减少（909 → 822）
+  → GPU 吞吐提升
+
+P/D 分离提升来自：
+  P 节点跳过重复 prefill
+  → 更快将请求发送给 D 节点
+  → D 节点 decode batch 变大
+  注：KV cache 仍完整传输（1Gbps 网络下传输时间 << prefill 时间）
+```
+
+**nsys profile 对比（单机，512并发）：**
+
+![nsys v12](doc/nsys-v12.png)
+
+```
+无 prefix cache：总时间 ~24s，Stream 13 占 96.1%
+有 prefix cache：总时间 ~21s，Stream 13 占 95.7%
 ```
 
 ## Attention shared memory 限制
