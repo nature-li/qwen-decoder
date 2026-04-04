@@ -8,8 +8,8 @@
 
 void Decoder::generate_continuous(std::vector<std::string>& user_inputs, int max_batch,
                                   int max_new_tokens, float temperature, int top_k,
-                                  std::mt19937& rng) {
-  Scheduler scheduler(max_batch, BLOCK_SIZE, get_block_pool());
+                                  std::mt19937& rng, bool enable_prefix_cache) {
+  Scheduler scheduler(max_batch, BLOCK_SIZE, get_block_pool(), enable_prefix_cache);
 
   // 初始化所有请求，插入 BOS token，加入 waiting 队列
   std::vector<Request*> all_requests;
@@ -206,6 +206,7 @@ void Decoder::generate_continuous(std::vector<std::string>& user_inputs, int max
         if (req->prefill_offset >= (int)req->prompt_tokens.size()) {
           req->prefill_done = true;
           req->cur_token = next_token;
+          scheduler.on_prefill_done(req);
         }
         // prefill 未完成时 next_token 丢弃，下一步继续 prefill
       } else {

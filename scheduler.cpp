@@ -1,7 +1,13 @@
 #include "scheduler.h"
 
-Scheduler::Scheduler(int max_batch, int block_size, BlockPool* pool)
-    : max_batch_(max_batch), block_size_(block_size), pool_(pool) {
+#include <iostream>
+
+Scheduler::Scheduler(int max_batch, int block_size, BlockPool* pool, bool enable_prefix_cache)
+    : max_batch_(max_batch),
+      block_size_(block_size),
+      pool_(pool),
+      enable_prefix_cache_(enable_prefix_cache),
+      prefix_cache_(pool) {
   running_.resize(max_batch, nullptr);
 }
 
@@ -9,10 +15,28 @@ void Scheduler::add_request(Request* req) { waiting_.push(req); }
 
 void Scheduler::fill_slots() {
   for (int i = 0; i < max_batch_; i++) {
-    if (running_[i] == nullptr && !waiting_.empty()) {
-      running_[i] = waiting_.front();
-      waiting_.pop();
+    if (waiting_.empty()) {
+      break;
     }
+
+    if (running_[i] != nullptr) {
+      continue;
+    }
+
+    Request* req = waiting_.front();
+    waiting_.pop();
+
+    if (enable_prefix_cache_) {
+      // 查 prefix cache，命中则复用物理块跳过 prefill
+      int hit_blocks = prefix_cache_.match(req->prompt_tokens, req->block_table);
+      if (hit_blocks > 0) {
+        // 跳过已命中的 token，直接从命中位置开始 prefill
+        req->pos = hit_blocks * BLOCK_SIZE;
+        req->prefill_offset = hit_blocks * BLOCK_SIZE;
+      }
+    }
+
+    running_[i] = req;
   }
 }
 
@@ -53,4 +77,10 @@ bool Scheduler::ensure_blocks(Request* req, int n_tokens) {
     req->block_table.add_block(block_id);
   }
   return true;
+}
+
+void Scheduler::on_prefill_done(Request* req) {
+  if (enable_prefix_cache_) {
+    prefix_cache_.insert(req->prompt_tokens, req->block_table);
+  }
 }

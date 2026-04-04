@@ -85,6 +85,28 @@ class BlockPool {
    */
   int get_kv_dim() const { return kv_dim_; }
 
+  /**
+   * 增加物理块的引用计数
+   * prefix cache 命中时调用，防止块被释放
+   * @param block_id 物理块 id
+   */
+  void inc_ref(int block_id);
+
+  /**
+   * 减少物理块的引用计数
+   * 引用计数降到 0 时真正释放回 free_blocks_
+   * 请求完成和 LRU 淘汰时调用
+   * @param block_id 物理块 id
+   */
+  void dec_ref(int block_id);
+
+  /**
+   * 获取物理块当前引用计数，主要用于调试
+   * @param block_id 物理块 id
+   * @return 当前引用计数
+   */
+  int get_ref(int block_id) const;
+
  private:
   // cuda 上 malloc 出的 blocks 总数
   int total_blocks_;
@@ -100,6 +122,8 @@ class BlockPool {
   __half* v_cache_;
   // 当前空闲的 block 列表
   std::queue<int> free_blocks_;
+  // 每个物理块的引用计数，普通分配初始值为 1
+  std::vector<int> ref_counts_;
 };
 
 /**
@@ -118,6 +142,13 @@ struct BlockTable {
    * @param block_id 物理块 id
    */
   void add_block(int block_id) { table_.push_back(block_id); }
+
+  /**
+   * 获取第 block_idx 个逻辑块对应的物理块 id
+   * @param block_idx 逻辑块下标
+   * @return 对应的物理块 id
+   */
+  int get_block_id(int block_idx) const { return table_[block_idx]; }
 
   /**
    * 获取第 pos 个 token 所在的物理块
@@ -150,9 +181,7 @@ struct BlockTable {
     table_.clear();
   }
 
-  size_t size() {
-    return table_.size();
-  }
+  size_t size() { return table_.size(); }
 
  private:
   /**

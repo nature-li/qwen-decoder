@@ -152,7 +152,8 @@ class Decoder {
                            int max_new_tokens,  // 每个请求最多生成多少个 token
                            float temperature,   // 采样温度，0 表示 greedy decoding
                            int top_k,           // top-k 采样
-                           std::mt19937& rng);  // 随机数生成器
+                           std::mt19937& rng,  // 随机数生成器
+                           bool enable_prefix_cache = true); // 是否开启 prefix kv_cache
 
   const Config& get_config() const { return config; }
 

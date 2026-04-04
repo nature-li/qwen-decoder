@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
 
 #define CHECK_CUDA(call)                                                                 \
   {                                                                                      \
@@ -13,7 +14,11 @@
   }
 
 BlockPool::BlockPool(int total_blocks, int block_size, int n_layers, int kv_dim)
-    : total_blocks_(total_blocks), block_size_(block_size), n_layers_(n_layers), kv_dim_(kv_dim) {
+    : total_blocks_(total_blocks),
+      block_size_(block_size),
+      n_layers_(n_layers),
+      kv_dim_(kv_dim),
+      ref_counts_(total_blocks, 0) {
   // k_cache 大小 和 v_cache 大小
   size_t size = (size_t)total_blocks * block_size * n_layers * kv_dim * sizeof(__half);
   // 分配 k_cache
@@ -41,7 +46,22 @@ int BlockPool::allocate() {
   }
   int id = free_blocks_.front();
   free_blocks_.pop();
+  ref_counts_[id] = 1;
   return id;
 }
 
-void BlockPool::free(int block_id) { free_blocks_.push(block_id); }
+void BlockPool::free(int block_id) { dec_ref(block_id); }
+
+void BlockPool::inc_ref(int block_id) {
+  ref_counts_[block_id]++;
+}
+
+void BlockPool::dec_ref(int block_id) {
+  ref_counts_[block_id]--;
+  if (ref_counts_[block_id] == 0) {
+    // 引用计数降到 0，真正释放
+    free_blocks_.push(block_id);
+  }
+}
+
+int BlockPool::get_ref(int block_id) const { return ref_counts_[block_id]; }
