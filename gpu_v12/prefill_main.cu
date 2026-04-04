@@ -2,6 +2,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <iostream>
 #include <mutex>
 #include <random>
 #include <thread>
@@ -9,6 +10,8 @@
 
 #include "gpu_decoder.h"
 #include "pd_comm.h"
+
+enum class PopResult { OK, EMPTY, CLOSED };
 
 // 线程安全队列
 template <typename T>
@@ -34,12 +37,14 @@ struct SafeQueue {
     return true;
   }
 
-  bool try_pop(T& val) {
+  PopResult try_pop(T& val) {
     std::lock_guard<std::mutex> lock(mu);
-    if (q.empty()) return false;
-    val = std::move(q.front());
-    q.pop();
-    return true;
+    if (!q.empty()) {
+      val = std::move(q.front());
+      q.pop();
+      return PopResult::OK;
+    }
+    return closed ? PopResult::CLOSED : PopResult::EMPTY;
   }
 
   void close() {
@@ -91,67 +96,76 @@ void p_recv_thread(PNode& pnode, SafeQueue<PrefillTask>& task_queue) {
 
 // 线程2：prefill
 void p_prefill_thread(GPUDecoder* decoder, BlockPool* pool, SafeQueue<PrefillTask>& task_queue,
-                      SafeQueue<PrefillResult>& result_queue, const Config& cfg,
-                      std::mt19937& rng) {
+                      SafeQueue<PrefillResult>& result_queue, const Config& cfg, std::mt19937& rng,
+                      PrefixCache& prefix_cache, bool enable_prefix_cache = true) {
   int max_batch = decoder->get_max_batch();
   int max_pps = decoder->get_max_prefill_tokens_per_step();
   int max_blk = decoder->get_max_blocks_per_seq();
 
-  // running：固定大小，nullptr 表示空槽
   std::vector<Request*> running(max_batch, nullptr);
   std::vector<PrefillTask> running_tasks(max_batch);
   std::vector<int> prefill_offset(max_batch, 0);
-
   int completed = 0;
 
   while (true) {
     std::vector<int> changed;
 
-    // ----------------------------------------------------------------
-    // 1. 填空槽
-    // ----------------------------------------------------------------
-    // 先非阻塞填所有空槽
-    for (int i = 0; i < max_batch; i++) {
-      if (running[i] != nullptr) continue;
-      PrefillTask task;
-      if (!task_queue.try_pop(task)) continue;
-      // 分配物理块
+    // 创建请求并加入运行槽
+    auto try_add_request = [&](int slot, PrefillTask task) -> bool {
       auto* r = new Request();
       r->id = task.req_id;
       r->pos = 0;
+      prefill_offset[slot] = 0;
+
+      if (enable_prefix_cache) {
+        // 查 prefix cache，命中则复用物理块跳过已命中的 token
+        int hit_blocks = prefix_cache.match(task.token_ids, r->block_table);
+        if (hit_blocks > 0) {
+          r->pos = hit_blocks * BLOCK_SIZE;
+          prefill_offset[slot] = hit_blocks * BLOCK_SIZE;
+          fprintf(stderr, "[P.prefill] prefix cache hit: req_id=%d hit_blocks=%d hit_tokens=%d\n",
+                  task.req_id, hit_blocks, hit_blocks * BLOCK_SIZE);
+        }
+      }
+
+      // 只分配还没有的 block
       int need_blocks = (task.n_tokens - 1) / BLOCK_SIZE + 1;
-      bool oom = false;
-      for (int b = 0; b < need_blocks; b++) {
+      for (int b = r->block_table.num_blocks(); b < need_blocks; b++) {
         int block_id = pool->allocate();
         if (block_id < 0) {
-          oom = true;
-          break;
+          delete r;
+          return false;  // OOM
         }
         r->block_table.add_block(block_id);
       }
-      if (oom) {
-        delete r;
-        goto done;
-      }
-      running[i] = r;
-      running_tasks[i] = std::move(task);
-      prefill_offset[i] = 0;
-      changed.push_back(i);
-      // fprintf(stderr, "[P.prefill] 加入 req_id=%d slot=%d n_tokens=%d\n", r->id, i,
-      //         running_tasks[i].n_tokens);
+
+      running[slot] = r;
+      running_tasks[slot] = std::move(task);
+      changed.push_back(slot);
+      return true;
+    };
+
+    // 尝试填充空槽
+    for (int i = 0; i < max_batch; i++) {
+      if (running[i] != nullptr) continue;
+      PrefillTask task;
+      auto ret = task_queue.try_pop(task);
+      if (ret == PopResult::CLOSED) goto done;
+      if (ret == PopResult::EMPTY) break;
+      if (!try_add_request(i, std::move(task))) goto done;
     }
 
-    // running 全空时阻塞等一个
+    // 没有任何请求在跑，阻塞等一个
     {
       bool any = false;
-      for (int i = 0; i < max_batch; i++)
+      for (int i = 0; i < max_batch; i++) {
         if (running[i]) {
           any = true;
           break;
         }
+      }
 
       if (!any) {
-        // 找第一个空槽
         int slot = -1;
         for (int i = 0; i < max_batch; i++) {
           if (running[i] == nullptr) {
@@ -159,47 +173,21 @@ void p_prefill_thread(GPUDecoder* decoder, BlockPool* pool, SafeQueue<PrefillTas
             break;
           }
         }
-        if (slot == -1) {
-          continue;  // 没有空槽，不应该发生
-        }
+        if (slot == -1) continue;
 
         PrefillTask task;
-        if (!task_queue.pop(task)) goto done;  // 队列关闭，退出
-
-        auto* r = new Request();
-        r->id = task.req_id;
-        r->pos = 0;
-        int need_blocks = (task.n_tokens - 1) / BLOCK_SIZE + 1;
-        bool oom = false;
-        for (int b = 0; b < need_blocks; b++) {
-          int block_id = pool->allocate();
-          if (block_id < 0) {
-            oom = true;
-            break;
-          }
-          r->block_table.add_block(block_id);
-        }
-        if (oom) {
-          delete r;
-          goto done;
-        }
-        running[slot] = r;
-        running_tasks[slot] = std::move(task);
-        prefill_offset[slot] = 0;
-        changed.push_back(slot);
-        fprintf(stderr, "[P.prefill] 阻塞等到 req_id=%d slot=%d\n", r->id, slot);
+        if (!task_queue.pop(task)) goto done;
+        fprintf(stderr, "[P.prefill] 阻塞等到 req_id=%d slot=%d\n", task.req_id, slot);
+        if (!try_add_request(slot, std::move(task))) goto done;
       }
     }
 
-    // ----------------------------------------------------------------
-    // 2. 组装 flat batch（chunked prefill）
-    // ----------------------------------------------------------------
+    // 构建 flat batch
     {
       std::vector<FlatRequest> flat_reqs;
       std::vector<int> flat_tokens, flat_positions, token_to_seq, slot_mapping;
       std::vector<int> last_tok_idx;
       std::vector<int> dec_flat, dec_pos, dec_seq;
-
       int flat_offset = 0;
       int prefill_budget = max_pps;
 
@@ -213,7 +201,6 @@ void p_prefill_thread(GPUDecoder* decoder, BlockPool* pool, SafeQueue<PrefillTas
         int n_tok = std::min(remaining, prefill_budget);
         if (n_tok <= 0) continue;
 
-        // ensure_pages
         int old_blocks = r->block_table.num_blocks();
         int need = (r->pos + n_tok - 1) / BLOCK_SIZE + 1;
         while (r->block_table.num_blocks() < need) {
@@ -241,6 +228,7 @@ void p_prefill_thread(GPUDecoder* decoder, BlockPool* pool, SafeQueue<PrefillTas
           token_to_seq.push_back(i);
           slot_mapping.push_back(phy * BLOCK_SIZE + off);
         }
+
         last_tok_idx.push_back(flat_offset + n_tok - 1);
         flat_offset += n_tok;
         prefill_budget -= n_tok;
@@ -248,12 +236,10 @@ void p_prefill_thread(GPUDecoder* decoder, BlockPool* pool, SafeQueue<PrefillTas
 
       if (flat_reqs.empty()) continue;
 
-      // 去重 changed，更新 block_table
       std::sort(changed.begin(), changed.end());
       changed.erase(std::unique(changed.begin(), changed.end()), changed.end());
       if (!changed.empty()) decoder->update_block_table_partial(running, changed, max_blk);
 
-      // forward
       auto t0 = std::chrono::steady_clock::now();
       decoder->forward_flat(flat_reqs, flat_tokens, flat_positions, token_to_seq, slot_mapping,
                             last_tok_idx, dec_flat, dec_pos, dec_seq, flat_offset);
@@ -262,7 +248,6 @@ void p_prefill_thread(GPUDecoder* decoder, BlockPool* pool, SafeQueue<PrefillTas
       fprintf(stderr, "[P.prefill] forward batch=%d tokens=%d %.1fms\n", (int)flat_reqs.size(),
               flat_offset, ms);
 
-      // 更新状态，完成的放入 result_queue
       for (int fi = 0; fi < (int)flat_reqs.size(); fi++) {
         auto& fr = flat_reqs[fi];
         int i = fr.req_idx;
@@ -271,16 +256,18 @@ void p_prefill_thread(GPUDecoder* decoder, BlockPool* pool, SafeQueue<PrefillTas
 
         auto& tk = running_tasks[i];
         int& poff = prefill_offset[i];
-
         r->pos += fr.n_tokens;
         poff += fr.n_tokens;
 
         if (poff >= tk.n_tokens) {
-          // prefill 完成，采样 first_token
           float* logits = decoder->get_logits_batch(fi);
           int first_token = sample_topk(logits, cfg.vocab_size, 30, 0.0f, rng);
 
-          // 收集 slots
+          if (enable_prefix_cache) {
+            // prefill 完成，写入 prefix cache
+            prefix_cache.insert(tk.token_ids, r->block_table);
+          }
+
           std::vector<int> slots(tk.n_tokens);
           for (int j = 0; j < tk.n_tokens; j++) {
             slots[j] = r->block_table.physical_idx(j) * BLOCK_SIZE + r->block_table.block_offset(j);
@@ -294,12 +281,9 @@ void p_prefill_thread(GPUDecoder* decoder, BlockPool* pool, SafeQueue<PrefillTas
           result.r = r;
           result_queue.push(std::move(result));
 
-          // 清空槽位
           running[i] = nullptr;
           prefill_offset[i] = 0;
           completed++;
-          // fprintf(stderr, "[P.prefill] 完成 req_id=%d slot=%d completed=%d\n", tk.req_id, i,
-          //         completed);
         }
       }
     }
@@ -351,15 +335,24 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  int max_batch = (argc >= 4) ? atoi(argv[3]) : 64;
+  int max_batch = (argc >= 3) ? atoi(argv[2]) : 64;
+  bool enable_prefix_cache = (argc >= 4) ? atoi(argv[3]) != 0 : true;
+  std::cout << "max_batch: " << max_batch << ", enable_prefix_cache: " << enable_prefix_cache
+            << std::endl;
   auto* decoder = new GPUDecoder(argv[1], max_batch, 4096, 4096, 4096);
   fprintf(stderr, "P节点模型加载完成\n");
 
   PNode pnode;
-  if (!pnode.init()) return 1;
+  if (!pnode.init()) {
+    std::cerr << "pnode init failed" << std::endl;
+    return 1;
+  }
 
   NcclComm nccl;
-  if (!nccl_init_prefill(nccl, pnode)) return 1;
+  if (!nccl_init_prefill(nccl, pnode)) {
+    std::cerr << "nccl init failed" << std::endl;
+    return 1;
+  }
 
   const Config& cfg = decoder->get_config();
   BlockPool* pool = decoder->get_block_pool();
@@ -369,9 +362,11 @@ int main(int argc, char** argv) {
   SafeQueue<PrefillResult> result_queue;
 
   // 启动三个线程
+  PrefixCache prefix_cache(pool);
   std::thread recv_th(p_recv_thread, std::ref(pnode), std::ref(task_queue));
   std::thread prefill_th(p_prefill_thread, decoder, pool, std::ref(task_queue),
-                         std::ref(result_queue), std::ref(cfg), std::ref(rng));
+                         std::ref(result_queue), std::ref(cfg), std::ref(rng),
+                         std::ref(prefix_cache), enable_prefix_cache);
   std::thread send_th(p_send_thread, std::ref(pnode), std::ref(nccl), pool, std::ref(result_queue),
                       std::ref(cfg));
 
