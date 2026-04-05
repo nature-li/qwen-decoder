@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package pd;
+
+// ============================================================================
+// 注册
+// ============================================================================
+message RegisterRequest {
+  // 空，D节点只需要建立连接
+}
+
+message RegisterResponse {
+  int32 d_node_id = 1;   // P节点分配的 id
+  bytes nccl_uid = 2;    // ncclUniqueId，128字节
+}
+
+// ============================================================================
+// Prefill 请求
+// ============================================================================
+message PrefillRequest {
+  int32 d_node_id = 1;
+  int32 req_id    = 2;
+  repeated int32 token_ids = 3;
+}
+
+message PrefillResponse {
+  int32 req_id      = 1;
+  int32 n_tokens    = 2;
+  int32 n_layers    = 3;
+  int32 kv_dim      = 4;
+  int32 first_token = 5;
+}
+
+// ============================================================================
+// 服务定义
+// ============================================================================
+service PrefillService {
+  // D节点注册，获取 d_node_id 和 NCCL uid
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // D节点发 prefill 请求，流式接收 response
+  rpc Prefill(stream PrefillRequest) returns (stream PrefillResponse);
+}
