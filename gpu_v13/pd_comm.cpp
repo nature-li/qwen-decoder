@@ -16,7 +16,10 @@ void NcclComm::ensure_buf(size_t size) {
 }
 
 NcclComm::~NcclComm() {
-  if (comm) ncclCommDestroy(comm);
+  if (comm) {
+    ncclCommAbort(comm);
+    ncclCommDestroy(comm);
+  }
   if (stream) cudaStreamDestroy(stream);
   if (d_buf) cudaFree(d_buf);
 }
@@ -28,8 +31,7 @@ NcclComm::~NcclComm() {
 bool PNode::init() {
   try {
     router.bind("tcp://*:" + std::to_string(PD_ZMQ_REQ_PORT));
-    reg_pull.bind("tcp://*:" + std::to_string(PD_ZMQ_REG_PORT));
-    reg_push.bind("tcp://*:" + std::to_string(PD_ZMQ_REG_RESP_PORT));
+    reg_router.bind("tcp://*:" + std::to_string(PD_ZMQ_REG_PORT));
     fprintf(stderr, "P节点 ZMQ 初始化完成\n");
     return true;
   } catch (zmq::error_t& e) {
@@ -39,23 +41,38 @@ bool PNode::init() {
 }
 
 int PNode::alloc_dnode(ncclUniqueId& uid) {
-  zmq::message_t reg_msg;
-  reg_pull.recv(reg_msg, zmq::recv_flags::none);
+  // ROUTER 收消息格式：[identity][空帧][消息体]
+  zmq::message_t identity_msg;
+  zmq::message_t empty_msg;
+  zmq::message_t body_msg;
+  reg_router.recv(identity_msg, zmq::recv_flags::none);
+  reg_router.recv(empty_msg, zmq::recv_flags::none);
+  reg_router.recv(body_msg, zmq::recv_flags::none);
 
   int d_node_id = next_d_node_id++;
-  fprintf(stderr, "P节点：新 D节点连接，分配 id=%d\n", d_node_id);
+  fprintf(stderr, "P节点：新 D节点连接，分配 id=%d，发回 uid\n", d_node_id);
 
   ncclGetUniqueId(&uid);
 
+  // 发回：[identity][空帧][消息体]
   struct {
     int32_t d_node_id;
     ncclUniqueId uid;
   } resp;
   resp.d_node_id = d_node_id;
   resp.uid = uid;
-  zmq::message_t resp_msg(sizeof(resp));
-  memcpy(resp_msg.data(), &resp, sizeof(resp));
-  reg_push.send(resp_msg, zmq::send_flags::none);
+
+  zmq::message_t resp_identity(identity_msg.data(), identity_msg.size());
+  zmq::message_t resp_empty(0);
+  zmq::message_t resp_body(sizeof(resp));
+  memcpy(resp_body.data(), &resp, sizeof(resp));
+
+  reg_router.send(resp_identity, zmq::send_flags::sndmore);
+  reg_router.send(resp_empty, zmq::send_flags::sndmore);
+  reg_router.send(resp_body, zmq::send_flags::none);
+
+  auto ret = resp_body.size() > 0;
+  fprintf(stderr, "P节点：uid 发送%s\n", ret ? "成功" : "失败");
 
   return d_node_id;
 }
@@ -236,8 +253,7 @@ bool DNode::init(const char* prefill_ip) {
   try {
     std::string ip = prefill_ip;
     dealer.connect("tcp://" + ip + ":" + std::to_string(PD_ZMQ_REQ_PORT));
-    reg_push.connect("tcp://" + ip + ":" + std::to_string(PD_ZMQ_REG_PORT));
-    reg_pull.connect("tcp://" + ip + ":" + std::to_string(PD_ZMQ_REG_RESP_PORT));
+    reg_dealer.connect("tcp://" + ip + ":" + std::to_string(PD_ZMQ_REG_PORT));
     fprintf(stderr, "D节点 ZMQ 初始化完成\n");
     return true;
   } catch (zmq::error_t& e) {
@@ -247,24 +263,31 @@ bool DNode::init(const char* prefill_ip) {
 }
 
 bool DNode::register_and_init_nccl() {
-  zmq::message_t reg_msg(0);
-  reg_push.send(reg_msg, zmq::send_flags::none);
+  // DEALER 发消息格式：[空帧][消息体]
+  zmq::message_t empty(0);
+  zmq::message_t body(0);  // 注册消息体为空
+  reg_dealer.send(empty, zmq::send_flags::sndmore);
+  reg_dealer.send(body, zmq::send_flags::none);
 
-  zmq::pollitem_t items[] = {{static_cast<void*>(reg_pull), 0, ZMQ_POLLIN, 0}};
+  // 等 P节点发回 d_node_id + uid
+  zmq::pollitem_t items[] = {{static_cast<void*>(reg_dealer), 0, ZMQ_POLLIN, 0}};
   int rc = zmq::poll(items, 1, std::chrono::milliseconds(10000));
   if (rc == 0) {
     fprintf(stderr, "D节点：等待 P节点注册响应超时\n");
     return false;
   }
 
-  zmq::message_t msg;
-  reg_pull.recv(msg, zmq::recv_flags::none);
+  // DEALER 收消息格式：[空帧][消息体]
+  zmq::message_t resp_empty;
+  zmq::message_t resp_body;
+  reg_dealer.recv(resp_empty, zmq::recv_flags::none);
+  reg_dealer.recv(resp_body, zmq::recv_flags::none);
 
   struct {
     int32_t d_node_id;
     ncclUniqueId uid;
   } resp;
-  memcpy(&resp, msg.data(), sizeof(resp));
+  memcpy(&resp, resp_body.data(), sizeof(resp));
   d_node_id = resp.d_node_id;
   fprintf(stderr, "D节点：P节点分配 id=%d，开始 NCCL 初始化\n", d_node_id);
 

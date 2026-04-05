@@ -16,22 +16,34 @@
 template <typename T>
 struct SafeQueue {
   std::mutex mu;
-  std::condition_variable cv;
+  std::condition_variable cv_not_full;   // 等队列不满
+  std::condition_variable cv_not_empty;  // 等队列不空
   std::queue<T> q;
   bool closed = false;
+  int max_size;  // 最大容量，0 表示无界
 
+  explicit SafeQueue(int max_size = 0) : max_size(max_size) {}
+
+  /**
+   * 阻塞直到队列不满再插入
+   */
   void push(T val) {
-    std::lock_guard<std::mutex> lock(mu);
+    std::unique_lock<std::mutex> lock(mu);
+    if (max_size > 0) {
+      cv_not_full.wait(lock, [&] { return (int)q.size() < max_size || closed; });
+    }
+    if (closed) return;
     q.push(std::move(val));
-    cv.notify_one();
+    cv_not_empty.notify_one();
   }
 
   bool pop(T& val) {
     std::unique_lock<std::mutex> lock(mu);
-    cv.wait(lock, [&] { return !q.empty() || closed; });
+    cv_not_empty.wait(lock, [&] { return !q.empty() || closed; });
     if (q.empty()) return false;
     val = std::move(q.front());
     q.pop();
+    cv_not_full.notify_one();  // 通知 push 可以继续
     return true;
   }
 
@@ -42,6 +54,7 @@ struct SafeQueue {
     if (!q.empty()) {
       val = std::move(q.front());
       q.pop();
+      cv_not_full.notify_one();
       return PopResult::OK;
     }
     return closed ? PopResult::CLOSED : PopResult::EMPTY;
@@ -50,7 +63,13 @@ struct SafeQueue {
   void close() {
     std::lock_guard<std::mutex> lock(mu);
     closed = true;
-    cv.notify_all();
+    cv_not_empty.notify_all();
+    cv_not_full.notify_all();
+  }
+
+  int size() {
+    std::lock_guard<std::mutex> lock(mu);
+    return (int)q.size();
   }
 };
 
@@ -116,6 +135,7 @@ void p_register_thread(PNode& pnode) {
       }
 
       pnode.register_dnode(d_node_id, nccl);
+      fprintf(stderr, "[P.register] D节点[%d] NCCL 初始化成功\n", d_node_id);
     }).detach();
   }
 }
@@ -168,8 +188,8 @@ void p_recv_thread(PNode& pnode, SafeQueue<PrefillTask>& task_queue) {
     task.n_tokens = req.n_tokens;
     task.token_ids = std::move(token_ids);
     task_queue.push(std::move(task));
-    fprintf(stderr, "[P.recv] d_node_id=%d req_id=%d n_tokens=%d\n", task.d_node_id, task.req_id,
-            task.n_tokens);
+    // fprintf(stderr, "[P.recv] d_node_id=%d req_id=%d n_tokens=%d\n", task.d_node_id, task.req_id,
+    //         task.n_tokens);
   }
 }
 
@@ -210,8 +230,8 @@ void p_prefill_thread(GPUDecoder* decoder, BlockPool* pool, PNode& pnode,
         if (hit_blocks > 0) {
           r->pos = hit_blocks * BLOCK_SIZE;
           prefill_offset[slot] = hit_blocks * BLOCK_SIZE;
-          fprintf(stderr, "[P.prefill] prefix cache hit: req_id=%d hit_blocks=%d hit_tokens=%d\n",
-                  task.req_id, hit_blocks, hit_blocks * BLOCK_SIZE);
+          // fprintf(stderr, "[P.prefill] prefix cache hit: req_id=%d hit_blocks=%d hit_tokens=%d\n",
+          //         task.req_id, hit_blocks, hit_blocks * BLOCK_SIZE);
         }
       }
 
@@ -344,8 +364,8 @@ void p_prefill_thread(GPUDecoder* decoder, BlockPool* pool, PNode& pnode,
                             last_tok_idx, dec_flat, dec_pos, dec_seq, flat_offset);
       auto t1 = std::chrono::steady_clock::now();
       double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-      fprintf(stderr, "[P.prefill] forward batch=%d tokens=%d %.1fms\n", (int)flat_reqs.size(),
-              flat_offset, ms);
+      // fprintf(stderr, "[P.prefill] forward batch=%d tokens=%d %.1fms\n", (int)flat_reqs.size(),
+      //         flat_offset, ms);
 
       for (int fi = 0; fi < (int)flat_reqs.size(); fi++) {
         auto& fr = flat_reqs[fi];
@@ -438,8 +458,8 @@ void p_send_thread(PNode& pnode, BlockPool* pool, SafeQueue<PrefillResult>& resu
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     double mb = (double)result.n_tokens * n_layers * kv_dim * 2 * sizeof(__half) / 1024 / 1024;
-    fprintf(stderr, "[P.send] d_node_id=%d req_id=%d KV: %.1fMB in %.1fms (%.1f MB/s)\n",
-            result.d_node_id, result.req_id, mb, ms, mb / ms * 1000);
+    // fprintf(stderr, "[P.send] d_node_id=%d req_id=%d KV: %.1fMB in %.1fms (%.1f MB/s)\n",
+    //         result.d_node_id, result.req_id, mb, ms, mb / ms * 1000);
 
     result.r->block_table.free_blocks([pool](int id) { pool->dec_ref(id); });
     delete result.r;
@@ -470,8 +490,8 @@ int main(int argc, char** argv) {
   std::mt19937 rng(42);
   PrefixCache prefix_cache(pool);
 
-  SafeQueue<PrefillTask> task_queue;
-  SafeQueue<PrefillResult> result_queue;
+  SafeQueue<PrefillTask> task_queue(max_batch * 2);
+  SafeQueue<PrefillResult> result_queue(max_batch * 2);
 
   std::thread register_th(p_register_thread, std::ref(pnode));
   std::thread cleanup_th(p_cleanup_thread, std::ref(pnode));

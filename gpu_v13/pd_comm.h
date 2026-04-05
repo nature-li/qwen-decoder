@@ -12,10 +12,8 @@
 #include <vector>
 #include <zmq.hpp>
 
-constexpr int PD_ZMQ_REQ_PORT = 9527;       // D → P：prefill 请求 + 心跳（DEALER→ROUTER）
-constexpr int PD_ZMQ_RESP_PORT = 9528;      // P → D：response（ROUTER→DEALER）
-constexpr int PD_ZMQ_REG_PORT = 9529;       // D → P：注册专用
-constexpr int PD_ZMQ_REG_RESP_PORT = 9530;  // P → D：注册 response 专用
+constexpr int PD_ZMQ_REQ_PORT = 9527;  // D → P：prefill 请求 + 心跳（DEALER→ROUTER）
+constexpr int PD_ZMQ_REG_PORT = 9529;  // D → P：注册专用
 constexpr int HEARTBEAT_INTERVAL_S = 5;
 constexpr int HEARTBEAT_TIMEOUT_S = 15;
 constexpr int NCCL_INIT_TIMEOUT_S = 30;
@@ -58,9 +56,8 @@ struct NcclComm {
 
 struct PNode {
   zmq::context_t ctx{1};
-  zmq::socket_t router{ctx, ZMQ_ROUTER};  // 接收请求 + 发 response，精确定向
-  zmq::socket_t reg_pull{ctx, ZMQ_PULL};  // 注册专用，p_register_thread 专用
-  zmq::socket_t reg_push{ctx, ZMQ_PUSH};  // 注册 response 专用
+  zmq::socket_t router{ctx, ZMQ_ROUTER};      // 接收请求 + 发 response，精确定向
+  zmq::socket_t reg_router{ctx, ZMQ_ROUTER};  // 注册专用，p_register_thread 专用
 
   // key: d_node_id
   std::unordered_map<int, NcclComm*> nccl_comms;
@@ -103,8 +100,7 @@ struct DNode {
   int d_node_id = -1;
   zmq::context_t ctx{1};
   zmq::socket_t dealer{ctx, ZMQ_DEALER};  // 发请求 + 收 response
-  zmq::socket_t reg_push{ctx, ZMQ_PUSH};
-  zmq::socket_t reg_pull{ctx, ZMQ_PULL};
+  zmq::socket_t reg_dealer{ctx, ZMQ_DEALER};
   NcclComm nccl;
 
   bool init(const char* prefill_ip);
