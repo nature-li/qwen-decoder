@@ -93,11 +93,10 @@ macro(add_infer_target target)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 endmacro()
 
-# gpu_v15 推理服务
 add_infer_target(inference_server
-    gpu_v15/inference_server.cu
-    gpu_v15/gpu_decoder.cu
-    gpu_v15/pd_comm.cpp
+    inference_server.cu
+    gpu_decoder.cu
+    pd_comm.cpp
     decoder.cpp
     common.cpp
     gguf_loader.cpp
@@ -105,10 +104,9 @@ add_infer_target(inference_server
     kv_cache.cpp
     prefix_cache.cpp)
 
-# gpu_v15 单机测试
-add_cuda_target(gpu_decoder_v15
-    gpu_v15/gpu_decoder.cu
-    gpu_v15/gpu_main.cu
+add_cuda_target(gpu_decoder_main
+    gpu_decoder.cu
+    gpu_main.cu
     decoder.cpp
     common.cpp
     gguf_loader.cpp
@@ -116,11 +114,10 @@ add_cuda_target(gpu_decoder_v15
     kv_cache.cpp
     prefix_cache.cpp)
 
-# gpu_v15 P/D 分离
 add_pd_target(prefill_node
-    gpu_v15/prefill_main.cu
-    gpu_v15/gpu_decoder.cu
-    gpu_v15/pd_comm.cpp
+    prefill_main.cu
+    gpu_decoder.cu
+    pd_comm.cpp
     decoder.cpp
     common.cpp
     gguf_loader.cpp
@@ -129,9 +126,9 @@ add_pd_target(prefill_node
     prefix_cache.cpp)
 
 add_pd_target(decode_node
-    gpu_v15/decode_main.cu
-    gpu_v15/gpu_decoder.cu
-    gpu_v15/pd_comm.cpp
+    decode_main.cu
+    gpu_decoder.cu
+    pd_comm.cpp
     decoder.cpp
     common.cpp
     gguf_loader.cpp
