@@ -17,14 +17,14 @@ struct RunState {
   float* v_cache;  // [n_layers, seq_len, kv_dim] Value Cache
 };
 
-class CPUDecoder : public Decoder {
+class CPUDecoder {
  public:
   CPUDecoder(const std::string& model_file);
   ~CPUDecoder();
 
-  void forward(int token, int pos) override;
-  void forward_prefill(const int* tokens, int n_tokens, int start_pos) override;
-  float* get_logits() override { return state.logits; }
+  void forward(int token, int pos);
+  void forward_prefill(const int* tokens, int n_tokens, int start_pos);
+  float* get_logits() { return state.logits; }
 
  private:
   ModelFile mf;
