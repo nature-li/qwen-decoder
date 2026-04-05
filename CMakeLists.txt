@@ -27,6 +27,17 @@ find_package(gRPC REQUIRED)
 message(STATUS "gRPC: ${gRPC_VERSION}")
 message(STATUS "Protobuf: ${Protobuf_VERSION}")
 
+# Drogon
+find_package(Drogon REQUIRED)
+message(STATUS "Drogon: ${Drogon_VERSION}")
+
+if(NOT TARGET c-ares_lib)
+  find_library(C_ARES_LIB cares)
+  add_library(c-ares_lib INTERFACE IMPORTED)
+  set_target_properties(c-ares_lib PROPERTIES
+      INTERFACE_LINK_LIBRARIES "${C_ARES_LIB}")
+endif()
+
 # 生成 proto
 set(PROTO_FILE ${CMAKE_SOURCE_DIR}/proto/pd_service.proto)
 set(PROTO_DIR ${CMAKE_SOURCE_DIR}/proto)
@@ -70,9 +81,23 @@ macro(add_pd_target target)
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 endmacro()
 
-add_cuda_target(gpu_decoder_v14
-    gpu_v14/gpu_decoder.cu
-    gpu_v14/gpu_main.cu
+macro(add_infer_target target)
+  add_executable(${target} ${ARGN})
+  target_link_libraries(${target} PRIVATE
+      CUDA::cudart cublas Drogon::Drogon cares
+      pd_proto gRPC::grpc++ protobuf::libprotobuf
+      ${NCCL_LIB})
+  target_include_directories(${target} PRIVATE
+      ${CMAKE_SOURCE_DIR} ${NCCL_INCLUDE} ${PROTO_DIR})
+  set_target_properties(${target} PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+endmacro()
+
+# gpu_v15 推理服务
+add_infer_target(inference_server
+    gpu_v15/inference_server.cu
+    gpu_v15/gpu_decoder.cu
+    gpu_v15/pd_comm.cpp
     decoder.cpp
     common.cpp
     gguf_loader.cpp
@@ -80,10 +105,22 @@ add_cuda_target(gpu_decoder_v14
     kv_cache.cpp
     prefix_cache.cpp)
 
+# gpu_v15 单机测试
+add_cuda_target(gpu_decoder_v15
+    gpu_v15/gpu_decoder.cu
+    gpu_v15/gpu_main.cu
+    decoder.cpp
+    common.cpp
+    gguf_loader.cpp
+    scheduler.cpp
+    kv_cache.cpp
+    prefix_cache.cpp)
+
+# gpu_v15 P/D 分离
 add_pd_target(prefill_node
-    gpu_v14/prefill_main.cu
-    gpu_v14/gpu_decoder.cu
-    gpu_v14/pd_comm.cpp
+    gpu_v15/prefill_main.cu
+    gpu_v15/gpu_decoder.cu
+    gpu_v15/pd_comm.cpp
     decoder.cpp
     common.cpp
     gguf_loader.cpp
@@ -92,9 +129,9 @@ add_pd_target(prefill_node
     prefix_cache.cpp)
 
 add_pd_target(decode_node
-    gpu_v14/decode_main.cu
-    gpu_v14/gpu_decoder.cu
-    gpu_v14/pd_comm.cpp
+    gpu_v15/decode_main.cu
+    gpu_v15/gpu_decoder.cu
+    gpu_v15/pd_comm.cpp
     decoder.cpp
     common.cpp
     gguf_loader.cpp
