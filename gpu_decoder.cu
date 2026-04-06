@@ -742,8 +742,8 @@ void GPUDecoder::update_block_table_partial(const std::vector<Request*>& running
      *  - ensure_pages 保证这个范围内的所有块都已分配物理块
      *  - 未分配的块（下标 >= n）不会被访问到，无需初始化
      */
-    CHECK_CUDA(cudaMemcpy(gs.block_table + i * max_blk, req->block_table.data(), n * sizeof(int),
-                          cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpyAsync(gs.block_table + i * max_blk, req->block_table.data(),
+                               n * sizeof(int), cudaMemcpyHostToDevice, stream));
   }
 }
 
@@ -768,23 +768,23 @@ void GPUDecoder::forward_flat(
   int n_dec = (int)dec_positions.size();
 
   // 上传元数据
-  CHECK_CUDA(cudaMemcpy(gs.d_tokens, flat_tokens.data(), total_tokens * sizeof(int),
-                        cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(gs.d_positions, flat_positions.data(), total_tokens * sizeof(int),
-                        cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(gs.d_token_seq, token_to_seq.data(), total_tokens * sizeof(int),
-                        cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(gs.d_slot_map, slot_mapping.data(), total_tokens * sizeof(int),
-                        cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(gs.d_last_tok_idx, last_tok_idx.data(), batch * sizeof(int),
-                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpyAsync(gs.d_tokens, flat_tokens.data(), total_tokens * sizeof(int),
+                             cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaMemcpyAsync(gs.d_positions, flat_positions.data(), total_tokens * sizeof(int),
+                             cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaMemcpyAsync(gs.d_token_seq, token_to_seq.data(), total_tokens * sizeof(int),
+                             cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaMemcpyAsync(gs.d_slot_map, slot_mapping.data(), total_tokens * sizeof(int),
+                             cudaMemcpyHostToDevice, stream));
+  CHECK_CUDA(cudaMemcpyAsync(gs.d_last_tok_idx, last_tok_idx.data(), batch * sizeof(int),
+                             cudaMemcpyHostToDevice, stream));
   if (n_dec > 0) {
-    CHECK_CUDA(cudaMemcpy(gs.d_dec_flat, dec_flat_idx.data(), n_dec * sizeof(int),
-                          cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(gs.d_dec_pos, dec_positions.data(), n_dec * sizeof(int),
-                          cudaMemcpyHostToDevice));
-    CHECK_CUDA(
-        cudaMemcpy(gs.d_dec_seq, dec_req_idx.data(), n_dec * sizeof(int), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpyAsync(gs.d_dec_flat, dec_flat_idx.data(), n_dec * sizeof(int),
+                               cudaMemcpyHostToDevice, stream));
+    CHECK_CUDA(cudaMemcpyAsync(gs.d_dec_pos, dec_positions.data(), n_dec * sizeof(int),
+                               cudaMemcpyHostToDevice, stream));
+    CHECK_CUDA(cudaMemcpyAsync(gs.d_dec_seq, dec_req_idx.data(), n_dec * sizeof(int),
+                               cudaMemcpyHostToDevice, stream));
   }
 
   /**
