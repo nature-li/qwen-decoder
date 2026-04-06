@@ -730,8 +730,6 @@ void GPUDecoder::forward_flat(
     const std::vector<int>& slot_mapping,    // 每个 token 的绝对物理槽位，KV cache 写入用
     const std::vector<int>& last_tok_idx,    // 每个请求最后一个 token 在 flat batch 里的位置
     const std::vector<int>& dec_flat_idx,    // decode token 在 flat batch 里的位置
-    const std::vector<int>& dec_positions,   // decode token 的绝对位置
-    const std::vector<int>& dec_req_idx,     // decode token 属于哪个请求
     int total_tokens)                        // flat batch 里的 token 总数
 {
   int dim = config.dim;

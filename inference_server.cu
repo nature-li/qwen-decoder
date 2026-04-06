@@ -218,7 +218,7 @@ void infer_thread(GPUDecoder* decoder, BlockPool* pool, RequestQueue& req_queue,
       std::vector<FlatRequest> flat_reqs;
       std::vector<int> flat_tokens, flat_positions, token_to_seq, slot_mapping;
       std::vector<int> last_tok_idx;
-      std::vector<int> dec_flat, dec_pos, dec_seq;
+      std::vector<int> dec_flat;
       int flat_offset = 0;
       int prefill_budget = max_pps;
 
@@ -301,8 +301,6 @@ void infer_thread(GPUDecoder* decoder, BlockPool* pool, RequestQueue& req_queue,
           slot_mapping.push_back(phy * BLOCK_SIZE + off);
           last_tok_idx.push_back(flat_offset);
           dec_flat.push_back(flat_offset);
-          dec_pos.push_back(r->pos);
-          dec_seq.push_back(i);
           flat_offset++;
         }
       }
@@ -317,7 +315,7 @@ void infer_thread(GPUDecoder* decoder, BlockPool* pool, RequestQueue& req_queue,
       }
 
       decoder->forward_flat(flat_reqs, flat_tokens, flat_positions, token_to_seq, slot_mapping,
-                            last_tok_idx, dec_flat, dec_pos, dec_seq, flat_offset);
+                            last_tok_idx, dec_flat, flat_offset);
 
       // 处理结果
       for (int fi = 0; fi < (int)flat_reqs.size(); fi++) {

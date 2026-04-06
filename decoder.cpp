@@ -184,8 +184,7 @@ void Decoder::generate_continuous(std::vector<std::string>& user_inputs, int max
 
     // forward: 一次处理所有 token
     forward_flat(flat_requests, flat_tokens, flat_positions, token_to_seq, slot_mapping,
-                 last_token_indices, decode_flat_indices, decode_positions, decode_req_indices,
-                 (int)flat_tokens.size());
+                 last_token_indices, decode_flat_indices, (int)flat_tokens.size());
 
     // 采样、更新状态
     for (int fi = 0; fi < (int)flat_requests.size(); fi++) {

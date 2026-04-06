@@ -249,7 +249,7 @@ void decode_thread_func(GPUDecoder* decoder, BlockPool* pool, int max_batch, int
 
     auto t_fwd_start = std::chrono::steady_clock::now();
     decoder->forward_flat(flat_reqs, flat_tokens, flat_positions, token_to_seq, slot_mapping,
-                          last_tok_idx, dec_flat, dec_pos, dec_seq, (int)flat_tokens.size());
+                          last_tok_idx, dec_flat, (int)flat_tokens.size());
     total_fwd_s +=
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t_fwd_start).count();
     steps++;

@@ -79,9 +79,7 @@ class GPUDecoder : public Decoder {
                     const std::vector<int>& flat_tokens, const std::vector<int>& flat_positions,
                     const std::vector<int>& token_to_seq, const std::vector<int>& slot_mapping,
                     const std::vector<int>& last_token_indices,
-                    const std::vector<int>& decode_flat_indices,
-                    const std::vector<int>& decode_positions,
-                    const std::vector<int>& decode_req_indices, int total_tokens) override;
+                    const std::vector<int>& decode_flat_indices, int total_tokens) override;
 
   float* get_logits_batch(int batch_idx) override;
   BlockPool* get_block_pool() override { return block_pool; }

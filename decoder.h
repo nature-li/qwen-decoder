@@ -64,10 +64,6 @@ class Decoder {
       const std::vector<int>& last_token_indices,
       // [n_decode] decode token 在 flat batch 里的位置，用于 gather/scatter
       const std::vector<int>& decode_flat_indices,
-      // [n_decode] decode token 的绝对位置，用于 decode attention
-      const std::vector<int>& decode_positions,
-      // [n_decode] decode token 属于哪个请求，用于查 block_table
-      const std::vector<int>& decode_req_indices,
       // flat batch 里的 token 总数
       int total_tokens) = 0;
 
@@ -87,7 +83,7 @@ class Decoder {
   /**
    * 返回最大并发数
    */
-  virtual int get_max_batch() const {return 0;}
+  virtual int get_max_batch() const { return 0; }
 
   /**
    * 返回单个请求最多占用多少个逻辑块
@@ -152,8 +148,8 @@ class Decoder {
                            int max_new_tokens,  // 每个请求最多生成多少个 token
                            float temperature,   // 采样温度，0 表示 greedy decoding
                            int top_k,           // top-k 采样
-                           std::mt19937& rng,  // 随机数生成器
-                           bool enable_prefix_cache = true); // 是否开启 prefix kv_cache
+                           std::mt19937& rng,   // 随机数生成器
+                           bool enable_prefix_cache = true);  // 是否开启 prefix kv_cache
 
   const Config& get_config() const { return config; }
 

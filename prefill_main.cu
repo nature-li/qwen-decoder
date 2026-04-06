@@ -181,7 +181,7 @@ void p_prefill_thread(GPUDecoder* decoder, BlockPool* pool, PNode& pnode,
       std::vector<FlatRequest> flat_reqs;
       std::vector<int> flat_tokens, flat_positions, token_to_seq, slot_mapping;
       std::vector<int> last_tok_idx;
-      std::vector<int> dec_flat, dec_pos, dec_seq;
+      std::vector<int> dec_flat;
       int flat_offset = 0;
       int prefill_budget = max_pps;
 
@@ -249,7 +249,7 @@ void p_prefill_thread(GPUDecoder* decoder, BlockPool* pool, PNode& pnode,
 
       auto t0 = std::chrono::steady_clock::now();
       decoder->forward_flat(flat_reqs, flat_tokens, flat_positions, token_to_seq, slot_mapping,
-                            last_tok_idx, dec_flat, dec_pos, dec_seq, flat_offset);
+                            last_tok_idx, dec_flat, flat_offset);
       auto t1 = std::chrono::steady_clock::now();
       double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
       fprintf(stderr, "[P.prefill] forward batch=%d tokens=%d %.1fms\n", (int)flat_reqs.size(),
