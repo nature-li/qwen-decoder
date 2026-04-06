@@ -54,6 +54,7 @@ void Decoder::generate_continuous(std::vector<std::string>& user_inputs, int max
     std::vector<int> last_token_indices;
 
     // decode token 单独收集，用于并行 attention
+    std::vector<int> prefill_flat_indices;
     // [n_decode] decode token 在 flat batch 里的位置，用于 gather/scatter q 和 xb
     std::vector<int> decode_flat_indices;
     // [n_decode] decode token 的绝对位置，用于 decode attention 计算 kv_end
@@ -121,6 +122,7 @@ void Decoder::generate_continuous(std::vector<std::string>& user_inputs, int max
           flat_positions.push_back(pos);
           token_to_req.push_back(i);
           token_slot.push_back(phy * BLOCK_SIZE + pos % BLOCK_SIZE);
+          prefill_flat_indices.push_back(flat_offset + j);
         }
 
         // 消耗本步 prefill 预算
@@ -184,7 +186,8 @@ void Decoder::generate_continuous(std::vector<std::string>& user_inputs, int max
 
     // forward: 一次处理所有 token
     forward_flat(flat_requests, flat_tokens, flat_positions, token_to_req, token_slot,
-                 last_token_indices, decode_flat_indices, (int)flat_tokens.size());
+                 last_token_indices, prefill_flat_indices, decode_flat_indices,
+                 (int)flat_tokens.size());
 
     // 采样、更新状态
     for (int fi = 0; fi < (int)flat_requests.size(); fi++) {

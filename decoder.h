@@ -62,7 +62,9 @@ class Decoder {
       const std::vector<int>& token_slot,
       // [batch_size] 每个请求最后一个 token 在 flat batch 里的位置，用于提取 logits
       const std::vector<int>& last_token_indices,
-      // [n_decode] decode token 在 flat batch 里的位置，用于 gather/scatter
+      // [n_decode] prefill token 在 flat batch 里的位置
+      const std::vector<int>& prefill_flat_indices,
+      // [n_decode] decode token 在 flat batch 里的位置
       const std::vector<int>& decode_flat_indices,
       // flat batch 里的 token 总数
       int total_tokens) = 0;

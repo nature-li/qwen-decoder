@@ -196,7 +196,7 @@ void decode_thread_func(GPUDecoder* decoder, BlockPool* pool, int max_batch, int
     std::vector<FlatRequest> flat_reqs;
     std::vector<int> flat_tokens, flat_positions, token_to_req;
     std::vector<int> token_slot, last_tok_idx;
-    std::vector<int> dec_flat, dec_pos;
+    std::vector<int> prefill_flat, dec_flat, dec_pos;
 
     for (int i = 0; i < (int)running.size(); i++) {
       Request* r = running[i];
@@ -248,7 +248,7 @@ void decode_thread_func(GPUDecoder* decoder, BlockPool* pool, int max_batch, int
 
     auto t_fwd_start = std::chrono::steady_clock::now();
     decoder->forward_flat(flat_reqs, flat_tokens, flat_positions, token_to_req, token_slot,
-                          last_tok_idx, dec_flat, (int)flat_tokens.size());
+                          last_tok_idx, prefill_flat, dec_flat, (int)flat_tokens.size());
     total_fwd_s +=
         std::chrono::duration<double>(std::chrono::steady_clock::now() - t_fwd_start).count();
     steps++;

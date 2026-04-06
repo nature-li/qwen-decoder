@@ -724,13 +724,14 @@ void GPUDecoder::update_block_table_partial(const std::vector<Request*>& running
 
 void GPUDecoder::forward_flat(
     const std::vector<FlatRequest>& flat_reqs,
-    const std::vector<int>& flat_tokens,     // 所有请求的 token id，按 flat 顺序打包
-    const std::vector<int>& flat_positions,  // 每个 token 的绝对位置，用于 RoPE
-    const std::vector<int>& token_to_req,    // 每个 token 属于哪个请求
-    const std::vector<int>& token_slot,    // 每个 token 的绝对物理槽位，KV cache 写入用
-    const std::vector<int>& last_tok_idx,    // 每个请求最后一个 token 在 flat batch 里的位置
-    const std::vector<int>& dec_flat_idx,    // decode token 在 flat batch 里的位置
-    int total_tokens)                        // flat batch 里的 token 总数
+    const std::vector<int>& flat_tokens,       // 所有请求的 token id，按 flat 顺序打包
+    const std::vector<int>& flat_positions,    // 每个 token 的绝对位置，用于 RoPE
+    const std::vector<int>& token_to_req,      // 每个 token 属于哪个请求
+    const std::vector<int>& token_slot,        // 每个 token 的绝对物理槽位，KV cache 写入用
+    const std::vector<int>& last_tok_idx,      // 每个请求最后一个 token 在 flat batch 里的位置
+    const std::vector<int>& prefill_flat_idx,  // decode token 在 flat batch 里的位置
+    const std::vector<int>& dec_flat_idx,      // decode token 在 flat batch 里的位置
+    int total_tokens)                          // flat batch 里的 token 总数
 {
   int dim = config.dim;
   int head_dim = config.dim / config.n_heads;
@@ -738,6 +739,7 @@ void GPUDecoder::forward_flat(
   int kv_mul = config.n_heads / config.n_kv_heads;
   int T = 256;  // threads per block
   int batch = (int)flat_reqs.size();
+  int n_prefill = (int)prefill_flat_idx.size();
   int n_dec = (int)dec_flat_idx.size();
 
   // 上传元数据
@@ -751,6 +753,13 @@ void GPUDecoder::forward_flat(
                              cudaMemcpyHostToDevice, stream));
   CHECK_CUDA(cudaMemcpyAsync(gs.d_last_tok_idx, last_tok_idx.data(), batch * sizeof(int),
                              cudaMemcpyHostToDevice, stream));
+
+  if (n_prefill > 0) {
+    CHECK_CUDA(cudaMemcpyAsync(gs.d_prefill_flat, prefill_flat_idx.data(),
+                               prefill_flat_idx.size() * sizeof(int), cudaMemcpyHostToDevice,
+                               stream));
+  }
+
   if (n_dec > 0) {
     CHECK_CUDA(cudaMemcpyAsync(gs.d_decode_flat, dec_flat_idx.data(), n_dec * sizeof(int),
                                cudaMemcpyHostToDevice, stream));
@@ -842,22 +851,7 @@ void GPUDecoder::forward_flat(
         total_tokens, l, config.n_layers, kv_dim);
     CHECK_KERNEL();
 
-    int total_prefill_tokens = total_tokens - n_dec;
-    if (total_prefill_tokens > 0) {
-      // 准备 prefill token 在 flat batch 里的全局偏移
-      std::vector<int> prefill_flat;
-      for (auto& fr : flat_reqs) {
-        if (!fr.is_prefill) continue;
-        for (int i = 0; i < fr.n_tokens; i++) {
-          prefill_flat.push_back(fr.flat_offset + i);
-        }
-      }
-
-      // 上传
-      CHECK_CUDA(cudaMemcpyAsync(gs.d_prefill_flat, prefill_flat.data(),
-                                 total_prefill_tokens * sizeof(int), cudaMemcpyHostToDevice,
-                                 stream));
-
+    if (n_prefill > 0) {
       /**
        * 每个 block 处理一个 head, 每个 block 256 个线程
        *
@@ -866,7 +860,7 @@ void GPUDecoder::forward_flat(
        * OUT:
        * - o_fr (来自 gs.xb)
        */
-      dim3 grid(config.n_heads, total_prefill_tokens);
+      dim3 grid(config.n_heads, prefill_flat_idx.size());
       prefill_attention_kernel<<<grid, T, smem, stream>>>(
           gs.q, block_pool->get_k_cache(), block_pool->get_v_cache(), gs.xb, gs.block_table,
           gs.d_token_seq, gs.d_positions, gs.d_prefill_flat, max_blocks_per_seq_, BLOCK_SIZE,
