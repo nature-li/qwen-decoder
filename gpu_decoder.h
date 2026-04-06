@@ -77,7 +77,7 @@ class GPUDecoder : public Decoder {
 
   void forward_flat(const std::vector<FlatRequest>& flat_requests,
                     const std::vector<int>& flat_tokens, const std::vector<int>& flat_positions,
-                    const std::vector<int>& token_to_seq, const std::vector<int>& slot_mapping,
+                    const std::vector<int>& token_to_req, const std::vector<int>& token_slot,
                     const std::vector<int>& last_token_indices,
                     const std::vector<int>& decode_flat_indices, int total_tokens) override;
 

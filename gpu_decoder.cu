@@ -391,7 +391,7 @@ __global__ void prefill_attention_kernel(
     const __half* v_cache,        // [total_slots, n_layers, kv_dim]
     __half* out,                  // [total_tokens, dim]
     const int* block_table,       // [max_batch, max_blocks_per_seq]
-    const int* token_to_seq,      // [total_tokens] d_token_seq
+    const int* token_to_req,      // [total_tokens] d_token_seq
     const int* flat_positions,    // [total_tokens] d_positions
     const int* prefill_flat_idx,  // [total_prefill_tokens] prefill token 在 flat batch 里的位置
     int max_blocks_per_seq, int block_size, int n_layers, int layer, int dim, int kv_dim,
@@ -415,7 +415,7 @@ __global__ void prefill_attention_kernel(
 
   // 通过 prefill_flat_idx 找到在 flat batch 里的真实位置
   int q_tok = prefill_flat_idx[p_tok];
-  int req = token_to_seq[q_tok];
+  int req = token_to_req[q_tok];
   int cur_pos = flat_positions[q_tok];
   int kv_end = cur_pos + 1;
 
@@ -514,7 +514,7 @@ __global__ void decode_attention_kernel(
     const __half* v_cache,
     __half* out,                // [total_tokens, dim]
     const int* block_table,     // [max_batch, max_blocks_per_seq]
-    const int* token_to_seq,    // [total_tokens] 复用 d_token_seq
+    const int* token_to_req,    // [total_tokens] 复用 d_token_seq
     const int* flat_positions,  // [total_tokens] 复用 d_positions
     const int* dec_flat_idx,    // [n_decode] decode token 在 flat batch 里的位置
     int layer, int max_blocks_per_seq, int block_size, int dim, int kv_dim, int head_dim,
@@ -538,7 +538,7 @@ __global__ void decode_attention_kernel(
   // 通过 dec_flat_idx 找到 flat batch 里的位置
   // 然后复用 d_token_seq 和 d_positions，不需要专用 buffer
   int q_tok = dec_flat_idx[b];
-  int req = token_to_seq[q_tok];
+  int req = token_to_req[q_tok];
   int pos = flat_positions[q_tok];
   int kv_end = pos + 1;
 
@@ -726,8 +726,8 @@ void GPUDecoder::forward_flat(
     const std::vector<FlatRequest>& flat_reqs,
     const std::vector<int>& flat_tokens,     // 所有请求的 token id，按 flat 顺序打包
     const std::vector<int>& flat_positions,  // 每个 token 的绝对位置，用于 RoPE
-    const std::vector<int>& token_to_seq,    // 每个 token 属于哪个请求
-    const std::vector<int>& slot_mapping,    // 每个 token 的绝对物理槽位，KV cache 写入用
+    const std::vector<int>& token_to_req,    // 每个 token 属于哪个请求
+    const std::vector<int>& token_slot,    // 每个 token 的绝对物理槽位，KV cache 写入用
     const std::vector<int>& last_tok_idx,    // 每个请求最后一个 token 在 flat batch 里的位置
     const std::vector<int>& dec_flat_idx,    // decode token 在 flat batch 里的位置
     int total_tokens)                        // flat batch 里的 token 总数
@@ -745,9 +745,9 @@ void GPUDecoder::forward_flat(
                              cudaMemcpyHostToDevice, stream));
   CHECK_CUDA(cudaMemcpyAsync(gs.d_positions, flat_positions.data(), total_tokens * sizeof(int),
                              cudaMemcpyHostToDevice, stream));
-  CHECK_CUDA(cudaMemcpyAsync(gs.d_token_seq, token_to_seq.data(), total_tokens * sizeof(int),
+  CHECK_CUDA(cudaMemcpyAsync(gs.d_token_seq, token_to_req.data(), total_tokens * sizeof(int),
                              cudaMemcpyHostToDevice, stream));
-  CHECK_CUDA(cudaMemcpyAsync(gs.d_slot_map, slot_mapping.data(), total_tokens * sizeof(int),
+  CHECK_CUDA(cudaMemcpyAsync(gs.d_slot_map, token_slot.data(), total_tokens * sizeof(int),
                              cudaMemcpyHostToDevice, stream));
   CHECK_CUDA(cudaMemcpyAsync(gs.d_last_tok_idx, last_tok_idx.data(), batch * sizeof(int),
                              cudaMemcpyHostToDevice, stream));

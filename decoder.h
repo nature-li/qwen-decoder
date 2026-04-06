@@ -40,7 +40,7 @@ class Decoder {
    * - matmul/ffn：所有 token 一起处理，batch 越大 GPU 利用率越高
    * - prefill attention：每个请求单独调用，串行处理（causal mask 不同）
    * - decode attention：所有 decode token 打包并行处理
-   * - KV cache 写入：通过 slot_mapping 直接定位物理槽位
+   * - KV cache 写入：通过 token_slot 直接定位物理槽位
    *
    * chunked prefill：
    * - 每步 prefill token 总数不超过 max_prefill_tokens_per_step
@@ -57,9 +57,9 @@ class Decoder {
       // [total_tokens] 每个 token 的绝对位置（pos），用于 RoPE
       const std::vector<int>& flat_positions,
       // [total_tokens] 每个 token 属于哪个请求（查 block_table 用）
-      const std::vector<int>& token_to_seq,
+      const std::vector<int>& token_to_req,
       // [total_tokens] 每个 token 对应的绝对物理槽位，用于 KV cache 写入
-      const std::vector<int>& slot_mapping,
+      const std::vector<int>& token_slot,
       // [batch_size] 每个请求最后一个 token 在 flat batch 里的位置，用于提取 logits
       const std::vector<int>& last_token_indices,
       // [n_decode] decode token 在 flat batch 里的位置，用于 gather/scatter

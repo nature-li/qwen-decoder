@@ -47,9 +47,9 @@ void Decoder::generate_continuous(std::vector<std::string>& user_inputs, int max
     // [total_tokens] 每个 token 的绝对位置（pos），用于 RoPE 和 KV cache 写入
     std::vector<int> flat_positions;
     // [total_tokens] 每个 token 属于哪个请求（scheduler.running 的下标），用于查 block_table
-    std::vector<int> token_to_seq;
+    std::vector<int> token_to_req;
     // [total_tokens] 每个 token 对应的绝对物理槽位，用于 KV cache 写入
-    std::vector<int> slot_mapping;
+    std::vector<int> token_slot;
     // [batch_size] 每个请求最后一个 token 在 flat batch 里的位置
     std::vector<int> last_token_indices;
 
@@ -119,8 +119,8 @@ void Decoder::generate_continuous(std::vector<std::string>& user_inputs, int max
           int phy = req->block_table.physical_idx(pos);
           flat_tokens.push_back(tok);
           flat_positions.push_back(pos);
-          token_to_seq.push_back(i);
-          slot_mapping.push_back(phy * BLOCK_SIZE + pos % BLOCK_SIZE);
+          token_to_req.push_back(i);
+          token_slot.push_back(phy * BLOCK_SIZE + pos % BLOCK_SIZE);
         }
 
         // 消耗本步 prefill 预算
@@ -145,8 +145,8 @@ void Decoder::generate_continuous(std::vector<std::string>& user_inputs, int max
         int phy = req->block_table.physical_idx(req->pos);
         flat_tokens.push_back(req->cur_token);
         flat_positions.push_back(req->pos);
-        token_to_seq.push_back(i);
-        slot_mapping.push_back(phy * BLOCK_SIZE + req->pos % BLOCK_SIZE);
+        token_to_req.push_back(i);
+        token_slot.push_back(phy * BLOCK_SIZE + req->pos % BLOCK_SIZE);
 
         // decode token 单独记录，forward_flat 里用于并行 attention
         decode_flat_indices.push_back(flat_offset);
@@ -183,7 +183,7 @@ void Decoder::generate_continuous(std::vector<std::string>& user_inputs, int max
             (int)flat_tokens.size() - (int)decode_positions.size());
 
     // forward: 一次处理所有 token
-    forward_flat(flat_requests, flat_tokens, flat_positions, token_to_seq, slot_mapping,
+    forward_flat(flat_requests, flat_tokens, flat_positions, token_to_req, token_slot,
                  last_token_indices, decode_flat_indices, (int)flat_tokens.size());
 
     // 采样、更新状态

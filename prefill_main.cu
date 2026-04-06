@@ -179,7 +179,7 @@ void p_prefill_thread(GPUDecoder* decoder, BlockPool* pool, PNode& pnode,
     // 构建 flat batch
     {
       std::vector<FlatRequest> flat_reqs;
-      std::vector<int> flat_tokens, flat_positions, token_to_seq, slot_mapping;
+      std::vector<int> flat_tokens, flat_positions, token_to_req, token_slot;
       std::vector<int> last_tok_idx;
       std::vector<int> dec_flat;
       int flat_offset = 0;
@@ -232,8 +232,8 @@ void p_prefill_thread(GPUDecoder* decoder, BlockPool* pool, PNode& pnode,
           int off = r->block_table.block_offset(pos);
           flat_tokens.push_back(tok);
           flat_positions.push_back(pos);
-          token_to_seq.push_back(i);
-          slot_mapping.push_back(phy * BLOCK_SIZE + off);
+          token_to_req.push_back(i);
+          token_slot.push_back(phy * BLOCK_SIZE + off);
         }
 
         last_tok_idx.push_back(flat_offset + n_tok - 1);
@@ -248,7 +248,7 @@ void p_prefill_thread(GPUDecoder* decoder, BlockPool* pool, PNode& pnode,
       if (!changed.empty()) decoder->update_block_table_partial(running, changed, max_blk);
 
       auto t0 = std::chrono::steady_clock::now();
-      decoder->forward_flat(flat_reqs, flat_tokens, flat_positions, token_to_seq, slot_mapping,
+      decoder->forward_flat(flat_reqs, flat_tokens, flat_positions, token_to_req, token_slot,
                             last_tok_idx, dec_flat, flat_offset);
       auto t1 = std::chrono::steady_clock::now();
       double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
