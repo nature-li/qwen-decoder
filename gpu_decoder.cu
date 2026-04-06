@@ -153,12 +153,11 @@ static void alloc_run_state(GPURunState& s, const Config& cfg, int max_batch,
   CHECK_CUDA(cudaMalloc(&s.logits_fp16, (size_t)max_batch * cfg.vocab_size * sizeof(__half)));
   CHECK_CUDA(cudaMallocHost(&s.logits, (size_t)max_batch * cfg.vocab_size * sizeof(float)));
 
+  // prefill 专用
+  CHECK_CUDA(cudaMalloc(&s.d_prefill_flat, max_flat_tokens * sizeof(int)));
+
   // decode 专用
-  CHECK_CUDA(cudaMalloc(&s.q_dec, (size_t)max_batch * dim * sizeof(__half)));
-  CHECK_CUDA(cudaMalloc(&s.xb_dec, (size_t)max_batch * dim * sizeof(__half)));
-  CHECK_CUDA(cudaMalloc(&s.d_dec_pos, max_batch * sizeof(int)));
-  CHECK_CUDA(cudaMalloc(&s.d_dec_seq, max_batch * sizeof(int)));
-  CHECK_CUDA(cudaMalloc(&s.d_dec_flat, max_batch * sizeof(int)));
+  CHECK_CUDA(cudaMalloc(&s.d_decode_flat, max_batch * sizeof(int)));
 }
 
 static void free_run_state(GPURunState& s) {
@@ -182,11 +181,8 @@ static void free_run_state(GPURunState& s) {
   cudaFree(s.logits_fp16);
   cudaFreeHost(s.logits);
 
-  cudaFree(s.q_dec);
-  cudaFree(s.xb_dec);
-  cudaFree(s.d_dec_pos);
-  cudaFree(s.d_dec_seq);
-  cudaFree(s.d_dec_flat);
+  cudaFree(s.d_prefill_flat);
+  cudaFree(s.d_decode_flat);
 }
 
 // ============================================================================
@@ -382,49 +378,24 @@ __global__ void fp16_to_fp32_kernel(float* out, const __half* in, int batch_size
   }
 }
 
-// Gather decode query from flat q buffer
-__global__ void gather_q_kernel(__half* q_dec, const __half* q_flat, const int* flat_idx, int n_dec,
-                                int dim) {
-  int i = blockIdx.x;
-  if (i >= n_dec) {
-    return;
-  }
-
-  int src = flat_idx[i];
-  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-    q_dec[i * dim + d] = q_flat[src * dim + d];
-  }
-}
-
-// Scatter decode attention output back to flat xb buffer
-__global__ void scatter_xb_kernel(__half* xb_flat, const __half* xb_dec, const int* flat_idx,
-                                  int n_dec, int dim) {
-  int i = blockIdx.x;
-  if (i >= n_dec) {
-    return;
-  }
-
-  int dst = flat_idx[i];
-  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
-    xb_flat[dst * dim + d] = xb_dec[i * dim + d];
-  }
-}
-
 constexpr int FA_BLOCK = 256;
 
 /**
- * Prefill attention (flash attention with causal mask, PagedAttention)
- * Grid: dim3(n_heads, n_tokens)
- * k_cache layout: [total_slots, n_layers, kv_dim]
- *   slot = physical_block * block_size + block_offset
+ * Prefill attention batch 版本（Ragged Attention）
+ * Grid: dim3(n_heads, total_prefill_tokens)
+ * 一次调用处理所有请求的所有 prefill token
  */
-__global__ void prefill_attention_kernel(const __half* q,        // [n_tokens, dim]
-                                         const __half* k_cache,  // [total_slots, n_layers, kv_dim]
-                                         const __half* v_cache,
-                                         __half* out,             // [n_tokens, dim]
-                                         const int* block_table,  // [max_blocks_per_seq]
-                                         int start_pos, int block_size, int n_layers, int layer,
-                                         int dim, int kv_dim, int head_dim, int kv_mul) {
+__global__ void prefill_attention_kernel(
+    const __half* q,              // [total_tokens, dim]
+    const __half* k_cache,        // [total_slots, n_layers, kv_dim]
+    const __half* v_cache,        // [total_slots, n_layers, kv_dim]
+    __half* out,                  // [total_tokens, dim]
+    const int* block_table,       // [max_batch, max_blocks_per_seq]
+    const int* token_to_seq,      // [total_tokens] d_token_seq
+    const int* flat_positions,    // [total_tokens] d_positions
+    const int* prefill_flat_idx,  // [total_prefill_tokens] prefill token 在 flat batch 里的位置
+    int max_blocks_per_seq, int block_size, int n_layers, int layer, int dim, int kv_dim,
+    int head_dim, int kv_mul) {
   extern __shared__ float sm[];
   float* s = sm;
   float* o = sm + FA_BLOCK;
@@ -433,17 +404,25 @@ __global__ void prefill_attention_kernel(const __half* q,        // [n_tokens, d
   float* gm = wd + 8;
   float* gd = gm + 1;
 
-  // head_idx 和 token_idx
-  int h = blockIdx.x, q_tok = blockIdx.y;
-  int tid = threadIdx.x, wid = tid / 32, lid = tid % 32;
+  int h = blockIdx.x;
+  // prefill token 编号（0..total_prefill_tokens-1）
+  int p_tok = blockIdx.y;
+  int tid = threadIdx.x;
+  int wid = tid / 32;
+  int lid = tid % 32;
   int kv_head = h / kv_mul;
   float scale = rsqrtf((float)head_dim);
 
-  int cur_pos = start_pos + q_tok;
+  // 通过 prefill_flat_idx 找到在 flat batch 里的真实位置
+  int q_tok = prefill_flat_idx[p_tok];
+  int req = token_to_seq[q_tok];
+  int cur_pos = flat_positions[q_tok];
   int kv_end = cur_pos + 1;
 
+  const int* bt = block_table + req * max_blocks_per_seq;
   const __half* qh = q + q_tok * dim + h * head_dim;
 
+  // 初始化
   for (int d = tid; d < head_dim; d += blockDim.x) o[d] = 0.0f;
   if (tid == 0) {
     *gm = -CUDART_INF_F;
@@ -451,18 +430,17 @@ __global__ void prefill_attention_kernel(const __half* q,        // [n_tokens, d
   }
   __syncthreads();
 
-  // 每个线程处理一个历史 token
+  // 分块遍历历史 KV，online softmax
   for (int st = 0; st < kv_end; st += FA_BLOCK) {
     int len = min(FA_BLOCK, kv_end - st);
     int t = st + tid;
 
     if (t < kv_end) {
-      int phy = block_table[t / block_size];
+      int phy = bt[t / block_size];
       int slot = phy * block_size + (t % block_size);
       const __half* kh =
           k_cache + (size_t)slot * n_layers * kv_dim + (size_t)layer * kv_dim + kv_head * head_dim;
       float sc = 0.0f;
-      // 每个线程计算全部 head_dim
       for (int d = 0; d < head_dim; d++) {
         sc += __half2float(qh[d]) * __half2float(kh[d]);
       }
@@ -472,31 +450,26 @@ __global__ void prefill_attention_kernel(const __half* q,        // [n_tokens, d
     }
     __syncthreads();
 
+    // warp reduce max
     float lm = warp_reduce_max(s[tid]);
-    if (lid == 0) {
-      wm[wid] = lm;
-    }
+    if (lid == 0) wm[wid] = lm;
     __syncthreads();
     if (wid == 0) {
       float v = warp_reduce_max((lid < 8) ? wm[lid] : -CUDART_INF_F);
-      if (lid == 0) {
-        wm[0] = v;
-      }
+      if (lid == 0) wm[0] = v;
     }
     __syncthreads();
 
     float mn = fmaxf(*gm, wm[0]);
     float cor = expf(*gm - mn);
+
+    // warp reduce sum
     float ld = warp_reduce_sum((t < kv_end) ? expf(s[tid] - mn) : 0.0f);
-    if (lid == 0) {
-      wd[wid] = ld;
-    }
+    if (lid == 0) wd[wid] = ld;
     __syncthreads();
     if (wid == 0) {
       float v = warp_reduce_sum((lid < 8) ? wd[lid] : 0.0f);
-      if (lid == 0) {
-        wd[0] = v;
-      }
+      if (lid == 0) wd[0] = v;
     }
     __syncthreads();
 
@@ -506,11 +479,12 @@ __global__ void prefill_attention_kernel(const __half* q,        // [n_tokens, d
     }
     __syncthreads();
 
+    // 累积 attention 输出
     for (int d = tid; d < head_dim; d += blockDim.x) {
       o[d] *= cor;
       for (int i = 0; i < len; i++) {
         int tt = st + i;
-        int phy = block_table[tt / block_size];
+        int phy = bt[tt / block_size];
         int slot = phy * block_size + (tt % block_size);
         const __half* vh = v_cache + (size_t)slot * n_layers * kv_dim + (size_t)layer * kv_dim +
                            kv_head * head_dim;
@@ -520,6 +494,7 @@ __global__ void prefill_attention_kernel(const __half* q,        // [n_tokens, d
     __syncthreads();
   }
 
+  // 写回结果
   __half* oh = out + q_tok * dim + h * head_dim;
   float dg = *gd;
   for (int d = tid; d < head_dim; d += blockDim.x) {
@@ -530,18 +505,20 @@ __global__ void prefill_attention_kernel(const __half* q,        // [n_tokens, d
 /**
  * Decode attention (flash attention, PagedAttention, batch)
  * Grid: dim3(n_heads, n_decode)
- * block_table: [max_batch, max_blocks_per_seq]
- * req_indices: [n_decode] which request each decode token belongs to
+ * 直接读写 flat batch 的 q 和 xb，不需要 gather/scatter
+ * 通过 dec_flat_idx 找到 flat batch 里的位置，复用 d_token_seq 和 d_positions
  */
-__global__ void decode_attention_kernel(const __half* q,        // [n_decode, dim]
-                                        const __half* k_cache,  // [total_slots, n_layers, kv_dim]
-                                        const __half* v_cache,
-                                        __half* out,             // [n_decode, dim]
-                                        const int* block_table,  // [max_batch, max_blocks_per_seq]
-                                        const int* positions,    // [n_decode]
-                                        const int* req_indices,  // [n_decode]
-                                        int layer, int max_blocks_per_seq, int block_size, int dim,
-                                        int kv_dim, int head_dim, int kv_mul, int n_layers) {
+__global__ void decode_attention_kernel(
+    const __half* q,        // [total_tokens, dim]
+    const __half* k_cache,  // [total_slots, n_layers, kv_dim]
+    const __half* v_cache,
+    __half* out,                // [total_tokens, dim]
+    const int* block_table,     // [max_batch, max_blocks_per_seq]
+    const int* token_to_seq,    // [total_tokens] 复用 d_token_seq
+    const int* flat_positions,  // [total_tokens] 复用 d_positions
+    const int* dec_flat_idx,    // [n_decode] decode token 在 flat batch 里的位置
+    int layer, int max_blocks_per_seq, int block_size, int dim, int kv_dim, int head_dim,
+    int kv_mul, int n_layers) {
   extern __shared__ float sm[];
   float* s = sm;
   float* o = sm + FA_BLOCK;
@@ -550,16 +527,23 @@ __global__ void decode_attention_kernel(const __half* q,        // [n_decode, di
   float* gm = wd + 8;
   float* gd = gm + 1;
 
-  int h = blockIdx.x, b = blockIdx.y;
-  int tid = threadIdx.x, wid = tid / 32, lid = tid % 32;
+  int h = blockIdx.x;
+  int b = blockIdx.y;
+  int tid = threadIdx.x;
+  int wid = tid / 32;
+  int lid = tid % 32;
   int kv_head = h / kv_mul;
   float scale = rsqrtf((float)head_dim);
 
-  int req = req_indices[b];
-  int pos = positions[b];
+  // 通过 dec_flat_idx 找到 flat batch 里的位置
+  // 然后复用 d_token_seq 和 d_positions，不需要专用 buffer
+  int q_tok = dec_flat_idx[b];
+  int req = token_to_seq[q_tok];
+  int pos = flat_positions[q_tok];
   int kv_end = pos + 1;
 
-  const __half* qh = q + b * dim + h * head_dim;
+  const __half* qh = q + q_tok * dim + h * head_dim;
+  __half* oh = out + q_tok * dim + h * head_dim;
   const int* bt = block_table + req * max_blocks_per_seq;
 
   for (int d = tid; d < head_dim; d += blockDim.x) o[d] = 0.0f;
@@ -589,30 +573,22 @@ __global__ void decode_attention_kernel(const __half* q,        // [n_decode, di
     __syncthreads();
 
     float lm = warp_reduce_max(s[tid]);
-    if (lid == 0) {
-      wm[wid] = lm;
-    }
+    if (lid == 0) wm[wid] = lm;
     __syncthreads();
     if (wid == 0) {
       float v = warp_reduce_max((lid < 8) ? wm[lid] : -CUDART_INF_F);
-      if (lid == 0) {
-        wm[0] = v;
-      }
+      if (lid == 0) wm[0] = v;
     }
     __syncthreads();
 
     float mn = fmaxf(*gm, wm[0]);
     float cor = expf(*gm - mn);
     float ld = warp_reduce_sum((t < kv_end) ? expf(s[tid] - mn) : 0.0f);
-    if (lid == 0) {
-      wd[wid] = ld;
-    }
+    if (lid == 0) wd[wid] = ld;
     __syncthreads();
     if (wid == 0) {
       float v = warp_reduce_sum((lid < 8) ? wd[lid] : 0.0f);
-      if (lid == 0) {
-        wd[0] = v;
-      }
+      if (lid == 0) wd[0] = v;
     }
     __syncthreads();
 
@@ -637,7 +613,6 @@ __global__ void decode_attention_kernel(const __half* q,        // [n_decode, di
     __syncthreads();
   }
 
-  __half* oh = out + b * dim + h * head_dim;
   float dg = *gd;
   for (int d = tid; d < head_dim; d += blockDim.x) {
     oh[d] = __float2half(o[d] / dg);
@@ -765,7 +740,7 @@ void GPUDecoder::forward_flat(
   int kv_mul = config.n_heads / config.n_kv_heads;
   int T = 256;  // threads per block
   int batch = (int)flat_reqs.size();
-  int n_dec = (int)dec_positions.size();
+  int n_dec = (int)dec_flat_idx.size();
 
   // 上传元数据
   CHECK_CUDA(cudaMemcpyAsync(gs.d_tokens, flat_tokens.data(), total_tokens * sizeof(int),
@@ -779,11 +754,7 @@ void GPUDecoder::forward_flat(
   CHECK_CUDA(cudaMemcpyAsync(gs.d_last_tok_idx, last_tok_idx.data(), batch * sizeof(int),
                              cudaMemcpyHostToDevice, stream));
   if (n_dec > 0) {
-    CHECK_CUDA(cudaMemcpyAsync(gs.d_dec_flat, dec_flat_idx.data(), n_dec * sizeof(int),
-                               cudaMemcpyHostToDevice, stream));
-    CHECK_CUDA(cudaMemcpyAsync(gs.d_dec_pos, dec_positions.data(), n_dec * sizeof(int),
-                               cudaMemcpyHostToDevice, stream));
-    CHECK_CUDA(cudaMemcpyAsync(gs.d_dec_seq, dec_req_idx.data(), n_dec * sizeof(int),
+    CHECK_CUDA(cudaMemcpyAsync(gs.d_decode_flat, dec_flat_idx.data(), n_dec * sizeof(int),
                                cudaMemcpyHostToDevice, stream));
   }
 
@@ -873,17 +844,21 @@ void GPUDecoder::forward_flat(
         total_tokens, l, config.n_layers, kv_dim);
     CHECK_KERNEL();
 
-    // Attention: prefill (per-request, serial) + decode (all parallel)
-    for (auto& fr : flat_reqs) {
-      if (!fr.is_prefill) {
-        continue;
+    int total_prefill_tokens = total_tokens - n_dec;
+    if (total_prefill_tokens > 0) {
+      // 准备 prefill token 在 flat batch 里的全局偏移
+      std::vector<int> prefill_flat;
+      for (auto& fr : flat_reqs) {
+        if (!fr.is_prefill) continue;
+        for (int i = 0; i < fr.n_tokens; i++) {
+          prefill_flat.push_back(fr.flat_offset + i);
+        }
       }
 
-      // 每个请求对应一个 block table
-      int* bt = gs.block_table + fr.req_idx * max_blocks_per_seq_;
-      __half* q_fr = gs.q + (size_t)fr.flat_offset * dim;
-      __half* o_fr = gs.xb + (size_t)fr.flat_offset * dim;
-      dim3 grid(config.n_heads, fr.n_tokens);
+      // 上传
+      CHECK_CUDA(cudaMemcpyAsync(gs.d_prefill_flat, prefill_flat.data(),
+                                 total_prefill_tokens * sizeof(int), cudaMemcpyHostToDevice,
+                                 stream));
 
       /**
        * 每个 block 处理一个 head, 每个 block 256 个线程
@@ -893,53 +868,27 @@ void GPUDecoder::forward_flat(
        * OUT:
        * - o_fr (来自 gs.xb)
        */
+      dim3 grid(config.n_heads, total_prefill_tokens);
       prefill_attention_kernel<<<grid, T, smem, stream>>>(
-          q_fr, block_pool->get_k_cache(), block_pool->get_v_cache(), o_fr, bt, fr.start_pos,
-          BLOCK_SIZE, config.n_layers, l, dim, kv_dim, head_dim, kv_mul);
+          gs.q, block_pool->get_k_cache(), block_pool->get_v_cache(), gs.xb, gs.block_table,
+          gs.d_token_seq, gs.d_positions, gs.d_prefill_flat, max_blocks_per_seq_, BLOCK_SIZE,
+          config.n_layers, l, dim, kv_dim, head_dim, kv_mul);
       CHECK_KERNEL();
     }
 
     if (n_dec > 0) {
       /**
-       * 把散落在 flat batch 里的 decode token 的 q 收集到连续内存
-       * 每个 block 收集一个 q, 每个 block 256 个线程
-       *
+       * 每个 block 处理一个 head, 每个 head 256 个线程
        * IN:
        * - gs.q
        * OUT:
-       * - gs.q_dec
-       */
-      gather_q_kernel<<<n_dec, T, 0, stream>>>(gs.q_dec, gs.q, gs.d_dec_flat, n_dec, dim);
-      CHECK_KERNEL();
-
-      dim3 grid_dec(config.n_heads, n_dec);
-      /**
-       * 每个 block 处理一个 head, 每个 head 256 个线程
-       *
-       * IN:
-       * - gs.q_dec
-       * OUT:
-       * - gs.xb_dec
-       */
-      decode_attention_kernel<<<grid_dec, T, smem, stream>>>(
-          gs.q_dec, block_pool->get_k_cache(), block_pool->get_v_cache(), gs.xb_dec, gs.block_table,
-          gs.d_dec_pos, gs.d_dec_seq, l, max_blocks_per_seq_, BLOCK_SIZE, dim, kv_dim, head_dim,
-          kv_mul, config.n_layers);
-      CHECK_KERNEL();
-
-      /**
-       * 把 decode attention 的输出写回 flat batch 对应的位置
-       *
-       * decode attention 单独处理，输出在 xb_dec [n_decode, dim]
-       * 后续的输出投影（wo matmul）处理整个 flat batch xb_flat [total_tokens, dim]
-       * 需要把 xb_dec 写回 xb_flat 的对应位置，才能让后续 matmul 看到完整数据
-       *
-       * IN:
-       * - gs.xb_dec
-       * OUT:
        * - gs.xb
        */
-      scatter_xb_kernel<<<n_dec, T, 0, stream>>>(gs.xb, gs.xb_dec, gs.d_dec_flat, n_dec, dim);
+      dim3 grid_dec(config.n_heads, n_dec);
+      decode_attention_kernel<<<grid_dec, T, smem, stream>>>(
+          gs.q, block_pool->get_k_cache(), block_pool->get_v_cache(), gs.xb, gs.block_table,
+          gs.d_token_seq, gs.d_positions, gs.d_decode_flat, l, max_blocks_per_seq_, BLOCK_SIZE, dim,
+          kv_dim, head_dim, kv_mul, config.n_layers);
       CHECK_KERNEL();
     }
 

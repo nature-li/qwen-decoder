@@ -58,12 +58,10 @@ struct GPURunState {
   __half* logits_fp16;      // [max_batch, vocab_size]
   float* logits;            // [max_batch, vocab_size] pinned host memory
 
+  // prefill 专用缓冲区
+  int* d_prefill_flat;
   // decode 专用缓冲区（所有 decode token 并行 attention 用）
-  __half* q_dec;    // [max_batch, dim] gather 出来的 decode query
-  __half* xb_dec;   // [max_batch, dim] decode attention 输出
-  int* d_dec_pos;   // [max_batch] decode token 的 pos
-  int* d_dec_seq;   // [max_batch] decode token 属于哪个请求
-  int* d_dec_flat;  // [max_batch] decode token 在 flat batch 里的位置
+  int* d_decode_flat;
 };
 
 // ============================================================================
@@ -87,7 +85,7 @@ class GPUDecoder : public Decoder {
 
   float* get_logits_batch(int batch_idx) override;
   BlockPool* get_block_pool() override { return block_pool; }
-  int get_max_batch() const {return max_batch_;}
+  int get_max_batch() const { return max_batch_; }
   int get_max_blocks_per_seq() const override { return max_blocks_per_seq_; }
   int get_max_prefill_tokens_per_step() const override { return max_prefill_tokens_per_step_; }
 
