@@ -17,7 +17,8 @@
 | `inference_server.cu` | HTTP 推理服务（Drogon），兼容 OpenAI API，支持单机和 P/D 分离两种模式 |
 | `prefill_main.cu` | P/D 分离 P节点入口 |
 | `decode_main.cu` | P/D 分离 D节点入口 |
-| `pd_comm.h/cpp` | P/D 分离通信层，gRPC 注册 + NCCL KV cache 传输 |
+| `pd_comm.h/cpp` | P/D 分离通信层，gRPC 连接管理 + NCCL KV cache 传输 |
+| `tp_main.cu` | Tensor Parallel 推理入口，MPI + NCCL 双机推理 |
 | `proto/` | gRPC proto 定义 |
 | `cpu_decoder.h/cpp` | CPU 版本实现 |
 | `tests/` | softmax / attention 算法对比实现（numpy/torch/C++/CUDA） |
@@ -54,6 +55,7 @@
 - 1-flat 推理 + chunked prefill，64并发总吞吐 1341 tokens/s，较手写 kernel 提升 187x
 - Prefix Cache，block 粒度 KV 复用 + 引用计数 + LRU 淘汰，512并发吞吐提升 20%
 - P/D 分离，gRPC 连接管理 + NCCL KV cache 传输，D节点 GPU 利用率 94.5%
+- Tensor Parallel，MPI + NCCL AllReduce 双机推理，权重按 Megatron-LM 列并行方式切分
 
 **推理服务：**
 - OpenAI 兼容 HTTP 接口（`POST /v1/chat/completions`）
@@ -66,6 +68,7 @@
 - NVIDIA GPU + CUDA 12.x（单机至少 10GB 显存）
 - CMake 3.18+
 - NCCL 2.26.2+
+- OpenMPI 4.1+（Tensor Parallel 模式需要）
 - gRPC 1.51.1+
 - Drogon 1.9.12+
 
@@ -113,7 +116,7 @@ snapshot_download(
 
 **推理服务（P/D 分离模式）：**
 ```bash
-# P节点先启动（enable_prefix_cache=1 开启）
+# P节点先启动
 NCCL_SOCKET_IFNAME=eth0 ./prefill_node qwen2.5-3b-instruct-fp16.gguf 512 1
 
 # inference_server 作为 D节点
@@ -121,6 +124,17 @@ NCCL_SOCKET_IFNAME=eth0 ./inference_server qwen2.5-3b-instruct-fp16.gguf 64 8080
 
 # 或者单独跑 decode_node
 NCCL_SOCKET_IFNAME=eth0 ./decode_node qwen2.5-3b-instruct-fp16.gguf <p_ip>
+```
+
+**Tensor Parallel 推理（双机）：**
+```bash
+mpirun -np 2 \
+  -host <machine1_ip>,<machine2_ip> \
+  -x NCCL_IB_DISABLE=1 \
+  -x NCCL_SOCKET_IFNAME=eth_direct \
+  --mca btl_tcp_if_include 192.168.100.0/24 \
+  --mca oob_tcp_if_include 192.168.100.0/24 \
+  ./tp_decoder qwen2.5-3b-instruct-fp16.gguf
 ```
 
 **测试接口：**
@@ -138,9 +152,6 @@ curl http://localhost:8080/v1/chat/completions \
 
 **压测：**
 ```bash
-# 安装 wrk
-sudo apt install wrk
-
 # bench.lua
 # wrk.method = "POST"
 # wrk.headers["Content-Type"] = "application/json"
@@ -193,6 +204,39 @@ wrk -t4 -c64 -d30s --timeout 60s -s bench.lua http://localhost:8080/v1/chat/comp
 | v10 | 64 | 68.5% | 1-flat，prefill 阶段 memcpy 较多 |
 | v11（D节点） | - | 94.5% | P/D 分离，D节点专注 decode |
 | v12（单机，512路）| 512 | 96.1% | Prefix Cache |
+
+## Tensor Parallel 实现
+
+### 权重切分规则
+
+GGUF 权重物理存储格式为 `[out_features, in_features]`，与 Megatron-LM 列并行方案对应：
+
+```
+wq/wk/wv/w1/w3：按输出维度切（物理内存外层，连续 memcpy）
+  rank0 取前 dim/n_ranks 行，rank1 取后 dim/n_ranks 行
+
+wo/w2：按输入维度切（物理内存内层，需逐行拷贝）
+  rank0 取前 dim/n_ranks 列，rank1 取后 dim/n_ranks 列
+```
+
+### 每层通信
+
+```
+Attention 后：ncclAllReduce（wo 输出部分和相加）
+FFN 后：      ncclAllReduce（w2 输出部分和相加）
+共 2 次 AllReduce / 层，n_ranks=1 时跳过（退化为单机版）
+```
+
+### 同步机制
+
+```
+CPU 侧（MPI）：广播用户输入、广播采样结果 next_token
+GPU 侧（NCCL）：每层两次 AllReduce，在 CUDA stream 里异步执行
+```
+
+### 网络限制
+
+当前使用 1Gbps 直连以太网，AllReduce 延迟约 0.2ms/次（desktop 发起）。生产环境建议使用 RDMA/InfiniBand 消除网络瓶颈。Qwen2.5-3B 的 `n_kv_heads=2`，最多支持 2 路 TP；更大模型（如 7B，`n_kv_heads=8`）最多支持 8 路 TP。
 
 ## 优化分析
 
@@ -328,6 +372,26 @@ cache 满时：淘汰链表尾部（最久未使用）
 
 ---
 
+### Tensor Parallel（双机 MPI + NCCL）
+
+基于 Megatron-LM 列并行方案，将模型权重按输出/输入维度切分到两台机器：
+
+```
+GGUF 权重物理存储 [out, in]：
+
+按输出维度切（wq/wk/wv/w1/w3）：
+  切外层维度 → 连续内存，直接 memcpy
+  各 rank 独立计算，输出 concat 后得到完整结果
+
+按输入维度切（wo/w2）：
+  切内层维度 → 不连续，需逐行拷贝
+  各 rank 计算部分和，AllReduce 后得到完整结果
+```
+
+每层 2 次 AllReduce，36 层共 72 次，1Gbps 网络下约 15ms/次推理（双机）。
+
+---
+
 ### inference_server（OpenAI 兼容推理服务）
 
 基于 Drogon 实现 HTTP 推理服务，支持 continuous batching，兼容 OpenAI `/v1/chat/completions` 接口：
@@ -352,6 +416,8 @@ cache 满时：淘汰链表尾部（最久未使用）
 `tests/` 目录包含算法验证代码：
 
 ```
-tests/softmax/    softmax → online softmax，numpy/torch/C++/CUDA 四种实现对比
-tests/attention/  standard attention → flash attention，numpy/C++/CUDA 三种实现对比
+tests/softmax/      softmax → online softmax，numpy/torch/C++/CUDA 四种实现对比
+tests/attention/    standard attention → flash attention，numpy/C++/CUDA 三种实现对比
+tests/cut_tensor/   TP 权重切分验证，cuBLAS 行列主序推导
+tests/nccl/         NCCL AllReduce 延迟测试
 ```
