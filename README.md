@@ -178,6 +178,8 @@ wrk -t4 -c64 -d30s --timeout 60s -s bench.lua http://localhost:8080/v1/chat/comp
 | GPU v9 | 869.9 | 121x | PagedAttention，64并发 |
 | GPU v10 | 1341.0 | 187x | 1-flat 推理，64并发 |
 | GPU v12（单机）| 2366.6 | 330x | Prefix Cache，512并发 |
+| GPU v14 | - | - | 实现 p / d 分离, p 节点可以同时服务多个 d 节点 |
+| GPU v17 | - |- | 切分 tensor, 模型纵向切分跨机器部署 |
 
 ### Prefix Cache 性能对比（512 并发，相同 prompt）
 
