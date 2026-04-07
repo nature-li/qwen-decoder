@@ -93,8 +93,8 @@ int load_tokenizer(Tokenizer& t, const GGUFFile& gguf);
 // 在词表里查找字符串，返回 token id，找不到返回 -1
 int vocab_lookup(const Tokenizer& t, const std::string& str);
 
-const char* decode(Tokenizer& t, int token);
-int encode(Tokenizer& t, const std::string& text, std::vector<int>& tokens);
+const char* decode(const Tokenizer& t, int token);
+int encode(const Tokenizer& t, const std::string& text, std::vector<int>& tokens);
 
 std::string apply_chat_template(const std::string& user_input);
 

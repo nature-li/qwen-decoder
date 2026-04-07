@@ -340,7 +340,7 @@ const std::unordered_map<std::string, char>& get_unicode_to_byte() {
   return u2b;
 }
 
-const char* decode(Tokenizer& t, int token) {
+const char* decode(const Tokenizer& t, int token) {
   if (t.token_type[token] == 3) return "";
 
   static char byte_piece[2];
@@ -392,7 +392,7 @@ int vocab_lookup(const Tokenizer& t, const std::string& str) {
   return -1;
 }
 
-int encode(Tokenizer& t, const std::string& text, std::vector<int>& tokens) {
+int encode(const Tokenizer& t, const std::string& text, std::vector<int>& tokens) {
   tokens.clear();
 
   // 1. 收集特殊 token，按长度从长到短排序（只做一次，但这里每次都排，可以预建）
