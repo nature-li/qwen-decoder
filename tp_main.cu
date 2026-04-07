@@ -398,10 +398,11 @@ static void generate_continuous(TPWeights& tw, TPRunState& s, BlockPool* pool, c
                                 Tokenizer& tokenizer, const NCCLContext& nccl,
                                 cublasHandle_t cublas, std::vector<std::string>& user_inputs,
                                 int max_batch, int max_new_tokens, float temperature, int top_k,
-                                std::mt19937& rng, int max_flat_tokens, int max_blocks_per_seq) {
+                                std::mt19937& rng, int max_flat_tokens, int max_blocks_per_seq,
+                                bool enable_prefix_cache) {
   int rank = nccl.rank;
 
-  Scheduler scheduler(max_batch, BLOCK_SIZE, pool, false);
+  Scheduler scheduler(max_batch, BLOCK_SIZE, pool, enable_prefix_cache);
 
   // 初始化所有请求
   std::vector<Request*> all_requests;
@@ -611,6 +612,10 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  bool enable_prefix_cache = true;
+  if (argc >= 4) atoi(argv[3]) != 0;
+  ;
+
   cudaSetDevice(0);
 
   // 1. NCCL 初始化
@@ -720,7 +725,8 @@ int main(int argc, char** argv) {
 
   // 8. 批量推理
   generate_continuous(tw, s, pool, cfg, tokenizer, nccl, cublas, inputs, max_batch, max_new_toks,
-                      temperature, top_k, rng, max_flat_tokens, max_blocks_per_seq);
+                      temperature, top_k, rng, max_flat_tokens, max_blocks_per_seq,
+                      enable_prefix_cache);
 
   delete pool;
   cublasDestroy(cublas);
