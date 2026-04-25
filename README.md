@@ -11,7 +11,7 @@
 | `decoder.h/cpp` | Decoder 基类，generate_continuous 逻辑 |
 | `scheduler.h/cpp` | 请求调度器，continuous batching 核心 |
 | `kv_cache.h/cpp` | BlockPool + BlockTable，PagedAttention KV cache 管理，引用计数 |
-| `prefix_cache.h/cpp` | Prefix Cache，block 粒度 KV 复用，LRU 淘汰 |
+| `prefix_cache.h/cpp` | Prefix Cache，block 粒度 KV 复用，复用 BlockPool free_list 作为 LRU |
 | `gpu_decoder.cu/h` | GPU 推理核心，包含所有 CUDA kernel |
 | `gpu_main.cu` | 单机推理入口 |
 | `inference_server.cu` | HTTP 推理服务（Drogon），兼容 OpenAI API，支持单机和 P/D 分离两种模式 |
@@ -53,7 +53,7 @@
 - continuous batching，GPU Kernels 占比从 27% 提升到 87%
 - PagedAttention，KV cache 动态分页，消除显存碎片
 - 1-flat 推理 + chunked prefill，64并发总吞吐 1341 tokens/s，较手写 kernel 提升 187x
-- Prefix Cache，block 粒度 KV 复用 + 引用计数 + LRU 淘汰，512并发吞吐提升 20%
+- Prefix Cache，block 粒度 KV 复用 + 引用计数，复用 free_list 作为 LRU，512并发吞吐提升 20%
 - P/D 分离，gRPC 连接管理 + NCCL KV cache 传输，D节点 GPU 利用率 94.5%
 - Tensor Parallel，MPI + NCCL AllReduce 双机推理，权重按 Megatron-LM 列并行方式切分
 
@@ -179,7 +179,8 @@ wrk -t4 -c64 -d30s --timeout 60s -s bench.lua http://localhost:8080/v1/chat/comp
 | GPU v10 | 1341.0 | 187x | 1-flat 推理，64并发 |
 | GPU v12（单机）| 2366.6 | 330x | Prefix Cache，512并发 |
 | GPU v14 | - | - | 实现 p / d 分离, p 节点可以同时服务多个 d 节点 |
-| GPU v17 | - |- | 切分权重 + MPI + ncclAllReduce 实现跨机器部署 |
+| GPU v17 | - | - | 切分权重 + MPI + ncclAllReduce 实现跨机器部署 |
+| GPU v18 | - | - | Prefix Cache 重构为 free_list 索引，取消 max_entries 限制，wrk +55% req/s |
 
 ### Prefix Cache 性能对比（512 并发，相同 prompt）
 
@@ -187,6 +188,15 @@ wrk -t4 -c64 -d30s --timeout 60s -s bench.lua http://localhost:8080/v1/chat/comp
 | :--- | :--- | :--- | :--- |
 | 单机（512路） | 1972 tokens/s | 2366 tokens/s | +20% |
 | P/D 分离（512路） | 1574 tokens/s | 1783 tokens/s | +13% |
+
+### inference_server Prefix Cache 对比（wrk -t4 -c64 -d30s，max_tokens=256）
+
+| 配置 | Req/s | 平均延迟 |
+| :--- | :--- | :--- |
+| 关 cache | 66.30 | 948ms |
+| 开 cache | 102.92 | 617ms |
+
+throughput +55%，latency -35%。
 
 ### prefill 阶段对比（prompt=3528 tokens）
 
@@ -371,6 +381,44 @@ cache 满时：淘汰链表尾部（最久未使用）
 ```
 
 ![nsys v12](doc/nsys-v12.png)
+
+---
+
+### GPU v17 → v18（Prefix Cache 重构）
+
+将 PrefixCache 从独立 LRU 结构重构为 BlockPool free_list 上的轻量 hash 索引层。
+
+核心改动：
+
+```
+旧设计：PrefixCache 持有独立引用 + 独立 lru_list_ + max_entries 上限
+新设计：PrefixCache 只维护 hash → block_id 映射，不持引用
+        free_list (std::list) 同时承担 LRU 职责
+```
+
+block 状态机：
+
+```
+ref=0          → 进 free_list 头部（hash 仍有效，可被 match 命中复用）
+match 命中且空闲 → 从 free_list 中间取走（hash 仍有效）
+allocate 覆盖写  → BlockPool 回调通知 PrefixCache erase hash
+```
+
+设计要点：
+
+- **push_front 释放 / pop_back 分配**：天然 LRU，新释放的最不容易被回收
+- **反向遍历 free_blocks**：利用 ref_count 单调性（命中 p_k 必然命中 p_0..p_{k-1}），让短 prefix（如 system prompt）停留在 free_list 头部
+- **取消 max_entries**：cache 容量 = BlockPool 空闲块数，动态无上限
+- **match 内置上限**：限制最大命中块数为 `(prompt_len - 1) / BLOCK_SIZE`，保证至少留 1 个 token 给 prefill 算 logits，避免全命中导致请求卡死
+
+inference_server 集成 prefix cache 后，wrk 测试（RTX 5060 Ti，Qwen2.5-3B fp16，max_tokens=256，相同 prompt）：
+
+| 配置 | Req/s | 平均延迟 |
+| :--- | :--- | :--- |
+| 关 cache | 66.30 | 948ms |
+| 开 cache | 102.92 | 617ms |
+
+throughput +55%，latency -35%。
 
 ---
 
