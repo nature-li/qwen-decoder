@@ -319,25 +319,23 @@ static void build_maps(std::unordered_map<char, std::string>& b2u,
 }
 
 const std::unordered_map<char, std::string>& get_byte_to_unicode() {
-  static std::unordered_map<char, std::string> b2u;
-  static std::unordered_map<std::string, char> u2b;
-  static bool initialized = false;
-  if (!initialized) {
+  static const auto maps = []() {
+    std::unordered_map<char, std::string> b2u;
+    std::unordered_map<std::string, char> u2b;
     build_maps(b2u, u2b);
-    initialized = true;
-  }
-  return b2u;
+    return std::make_pair(std::move(b2u), std::move(u2b));
+  }();
+  return maps.first;
 }
 
 const std::unordered_map<std::string, char>& get_unicode_to_byte() {
-  static std::unordered_map<char, std::string> b2u;
-  static std::unordered_map<std::string, char> u2b;
-  static bool initialized = false;
-  if (!initialized) {
+  static const auto maps = []() {
+    std::unordered_map<char, std::string> b2u;
+    std::unordered_map<std::string, char> u2b;
     build_maps(b2u, u2b);
-    initialized = true;
-  }
-  return u2b;
+    return std::make_pair(std::move(b2u), std::move(u2b));
+  }();
+  return maps.second;
 }
 
 const char* decode(const Tokenizer& t, int token) {
