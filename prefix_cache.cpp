@@ -25,7 +25,11 @@ uint64_t PrefixCache::hash_prefix(const std::vector<int>& tokens, int n) {
 
 int PrefixCache::match(const std::vector<int>& tokens,
                        BlockTable& block_table) {
-  int n_full_blocks = (int)tokens.size() / BLOCK_SIZE;
+  int prompt_len = (int)tokens.size();
+  // 限制最大命中块数：至少留 1 个 token 给 prefill 算 logits，
+  // 否则全命中时 prefill 阶段无 token 可处理，请求会卡死
+  int max_blocks = std::max(0, (prompt_len - 1) / BLOCK_SIZE);
+  int n_full_blocks = std::min(prompt_len / BLOCK_SIZE, max_blocks);
   int hit_blocks = 0;
 
   for (int b = 0; b < n_full_blocks; b++) {
@@ -51,7 +55,9 @@ int PrefixCache::match(const std::vector<int>& tokens,
     hit_blocks++;
   }
 
-  fprintf(stderr, "命中了 %d 个 blocks\n", hit_blocks);
+  if (hit_blocks > 0) {
+    fprintf(stderr, "命中了 %d 个 blocks\n", hit_blocks);
+  }
   return hit_blocks;
 }
 

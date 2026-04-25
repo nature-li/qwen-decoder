@@ -9,7 +9,7 @@
 
 struct Request {
   // 请求 id
-  int id;
+  int id = -1;
   // 原始 prompt
   std::string input;
   // prompt tokens

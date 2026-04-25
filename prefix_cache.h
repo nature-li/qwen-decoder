@@ -48,8 +48,12 @@ class PrefixCache {
    * 最长前缀匹配
    * 从第一个 block 开始逐块匹配，遇到未命中立即停止
    * 命中的物理块写入 block_table，并根据当前状态处理引用:
-   *   - 在 free_list 里：take_from_free_list（ref 变 1）
-   *   - 被其他请求持有：inc_ref（ref + 1）
+   * - 在 free_list 里：take_from_free_list（ref 变 1）
+   * - 被其他请求持有：inc_ref（ref + 1）
+   * 
+   * 注意: 内部限制最多命中 (prompt_len - 1) / BLOCK_SIZE 块，
+   * 保证至少留 1 个 token 给 prefill 算 logits，避免 prompt
+   * 全部命中时 prefill 阶段无 token 可处理导致请求卡死
    *
    * @param tokens 请求的完整 prompt token 序列
    * @param block_table 命中的物理块写入这里

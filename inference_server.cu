@@ -72,7 +72,8 @@ struct RequestQueue {
 // ============================================================================
 // 推理线程：支持单机和 P/D 分离两种模式
 // ============================================================================
-void infer_thread(GPUDecoder* decoder, BlockPool* pool, RequestQueue& req_queue, DNode* dnode) {
+void infer_thread(GPUDecoder* decoder, BlockPool* pool, PrefixCache* prefix_cache,
+                  RequestQueue& req_queue, DNode* dnode) {
   const Config& cfg = decoder->get_config();
   int max_batch = decoder->get_max_batch();
   int max_pps = decoder->get_max_prefill_tokens_per_step();
@@ -169,11 +170,29 @@ void infer_thread(GPUDecoder* decoder, BlockPool* pool, RequestQueue& req_queue,
       // 分配 block
       auto* r = new Request();
       r->id = next_req_id++;
-      r->pos = 0;
 
+      int prompt_len = (int)req->token_ids.size();
+      int hit_blocks = 0;
+      int hit_tokens = 0;
+
+      // 单机模式才用 prefix cache（P/D 模式 prefill 在 P 节点做，D 节点不用）
+      if (!pd_mode) {
+        hit_blocks = prefix_cache->match(req->token_ids, r->block_table);
+        hit_tokens = hit_blocks * BLOCK_SIZE;
+      }
+
+      // 防御性检查：max_blocks 限制理论上保证 hit_tokens < prompt_len
+      // 这里兜底，避免任何边界情况导致 prefill 卡死
+      assert(hit_tokens < prompt_len);
+      if (hit_tokens >= prompt_len) {
+        hit_tokens = prompt_len - 1;
+      }
+      r->pos = hit_tokens;
+
+      // 为剩余 token 分配 block
       int need_blocks = ((int)req->token_ids.size() - 1) / BLOCK_SIZE + 1;
       bool oom = false;
-      for (int b = 0; b < need_blocks; b++) {
+      while (r->block_table.num_blocks() < need_blocks) {
         int block_id = pool->allocate();
         if (block_id < 0) {
           oom = true;
@@ -183,6 +202,8 @@ void infer_thread(GPUDecoder* decoder, BlockPool* pool, RequestQueue& req_queue,
       }
 
       if (oom) {
+        // OOM 处理：释放已分配的 block，请求放回队列
+        r->block_table.free_blocks([pool](int id) { pool->free(id); });
         delete r;
         req_queue.push(req);
         break;
@@ -190,7 +211,7 @@ void infer_thread(GPUDecoder* decoder, BlockPool* pool, RequestQueue& req_queue,
 
       running[i].req = req;
       running[i].r = r;
-      running[i].prefill_offset = 0;
+      running[i].prefill_offset = hit_tokens;
       running[i].prefill_done = false;
       running_ptrs[i] = r;
       changed.push_back(i);
@@ -338,6 +359,11 @@ void infer_thread(GPUDecoder* decoder, BlockPool* pool, RequestQueue& req_queue,
                 sample_topk(logits, cfg.vocab_size, rr.req->top_k, rr.req->temperature, rng);
             r->cur_token = first_token;
             rr.prefill_done = true;
+
+            // 保存 kv cache, 复用 prefix caching
+            if (!pd_mode) {
+              prefix_cache->insert(rr.req->token_ids, r->block_table);
+            }
           }
 
         } else {
@@ -536,6 +562,8 @@ int main(int argc, char** argv) {
   fprintf(stderr, "模型加载完成，max_batch=%d port=%d\n", max_batch, port);
 
   BlockPool* pool = decoder->get_block_pool();
+  // 新建 PrefixCache 实例
+  PrefixCache prefix_cache(pool);
   RequestQueue req_queue;
   std::atomic<int> req_id_counter{0};
 
@@ -550,7 +578,7 @@ int main(int argc, char** argv) {
   }
 
   // 启动推理线程
-  std::thread infer_th(infer_thread, decoder, pool, std::ref(req_queue), dnode);
+  std::thread infer_th(infer_thread, decoder, pool, &prefix_cache, std::ref(req_queue), dnode);
 
   // 配置 Drogon
   drogon::app()
